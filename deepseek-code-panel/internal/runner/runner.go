@@ -17,6 +17,12 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
+const (
+	maxFrontendEventRawChars  = 12000
+	maxFrontendEventTextChars = 80000
+	frontendTruncatedNote     = "\n[内容过长，前端事件已截断；完整内容已写入本地日志]\n"
+)
+
 // Runner manages concurrent claude CLI processes.
 type Runner struct {
 	mu   sync.Mutex
@@ -233,10 +239,11 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 					displayParts = append(displayParts, display)
 					outputMu.Unlock()
 				}
+				frontendDisplay := truncateFrontendPayload(display, maxFrontendEventTextChars)
 				runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 					Type:            eventType,
-					Text:            display,
-					Raw:             line,
+					Text:            frontendDisplay,
+					Raw:             truncateFrontendPayload(line, maxFrontendEventRawChars),
 					RunID:           runID,
 					ThreadID:        req.ThreadID,
 					ClaudeSessionID: parser.sessionID,
@@ -246,8 +253,8 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 			} else {
 				runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 					Type:            "stdout",
-					Text:            line,
-					Raw:             line,
+					Text:            truncateFrontendPayload(line, maxFrontendEventTextChars),
+					Raw:             truncateFrontendPayload(line, maxFrontendEventRawChars),
 					RunID:           runID,
 					ThreadID:        req.ThreadID,
 					ClaudeSessionID: parser.sessionID,
@@ -269,8 +276,8 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 			outputMu.Unlock()
 			runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 				Type:            "stderr",
-				Text:            line,
-				Raw:             line,
+				Text:            truncateFrontendPayload(line, maxFrontendEventTextChars),
+				Raw:             truncateFrontendPayload(line, maxFrontendEventRawChars),
 				RunID:           runID,
 				ThreadID:        req.ThreadID,
 				ClaudeSessionID: parser.sessionID,
@@ -426,6 +433,18 @@ func formatDuration(ms int64) string {
 	m := s / 60
 	s = s % 60
 	return fmt.Sprintf("%dm%ds", m, s)
+}
+
+func truncateFrontendPayload(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	note := frontendTruncatedNote
+	keep := limit - len(note)
+	if keep <= 0 {
+		return value[:limit]
+	}
+	return value[:keep] + note
 }
 
 // meta returns the structured metadata for the most recent extract call.

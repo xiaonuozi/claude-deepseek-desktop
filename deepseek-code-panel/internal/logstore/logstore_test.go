@@ -56,6 +56,48 @@ INSERT INTO runs (
 	if entries[0].ThreadID != "run-1" {
 		t.Fatalf("expected migrated thread id run-1, got %q", entries[0].ThreadID)
 	}
+	if entries[0].DisplayOutput != "" || entries[0].RawOutput != "" {
+		t.Fatalf("recent logs should not include heavy payloads, got display=%q raw=%q", entries[0].DisplayOutput, entries[0].RawOutput)
+	}
+}
+
+func TestGetThreadLimitsHeavyPayloads(t *testing.T) {
+	dir := t.TempDir()
+	store, err := openLogStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.db.Close()
+
+	if err := store.Append(LogEntry{
+		ID:             "run-heavy",
+		ThreadID:       "thread-heavy",
+		CreatedAt:      "2026-04-28T09:00:00+08:00",
+		ProjectPath:    `C:\test`,
+		Model:          "deepseek-v4-pro",
+		PermissionMode: "default",
+		Prompt:         "heavy",
+		DisplayOutput:  strings.Repeat("d", maxFrontendDisplayChars+1000),
+		RawOutput:      strings.Repeat("r", maxFrontendRawChars+1000),
+		ExitCode:       0,
+		DurationMS:     42,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := store.GetThread("thread-heavy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if len(entries[0].DisplayOutput) > maxFrontendDisplayChars {
+		t.Fatalf("display payload was not limited: %d", len(entries[0].DisplayOutput))
+	}
+	if len(entries[0].RawOutput) > maxFrontendRawChars {
+		t.Fatalf("raw payload was not limited: %d", len(entries[0].RawOutput))
+	}
 }
 
 func TestDeleteThreadsPrunesLegacyJSONL(t *testing.T) {

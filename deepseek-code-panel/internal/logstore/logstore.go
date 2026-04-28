@@ -14,6 +14,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const (
+	maxFrontendDisplayChars = 500000
+	maxFrontendRawChars     = 700000
+	truncatedPayloadNote    = "\n\n[内容过长，界面仅显示截断预览；完整内容保存在本地日志数据库]\n"
+)
+
 var (
 	instance *LogStore
 	initMu   sync.Mutex
@@ -200,7 +206,7 @@ func (ls *LogStore) GetRecent(limit int) ([]LogEntry, error) {
 		limit = 20
 	}
 	rows, err := ls.db.Query(`
-SELECT r.id, r.thread_id, r.claude_session_id, r.created_at, r.project_path, r.model, r.permission_mode, r.prompt, r.display_output, r.raw_output, r.exit_code, r.duration_ms, r.input_tokens, r.output_tokens
+SELECT r.id, r.thread_id, r.claude_session_id, r.created_at, r.project_path, r.model, r.permission_mode, r.prompt, '', '', r.exit_code, r.duration_ms, r.input_tokens, r.output_tokens
 FROM runs r
 JOIN (
 	SELECT COALESCE(NULLIF(thread_id, ''), id) AS thread_key, MAX(created_at) AS latest_created_at
@@ -239,6 +245,7 @@ LIMIT ?`, limit)
 		if entry.ThreadID == "" {
 			entry.ThreadID = entry.ID
 		}
+		limitLogEntryPayload(&entry)
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -286,6 +293,7 @@ ORDER BY created_at ASC`, threadID)
 		if entry.ThreadID == "" {
 			entry.ThreadID = entry.ID
 		}
+		limitLogEntryPayload(&entry)
 		entries = append(entries, entry)
 	}
 	if err := rows.Err(); err != nil {
@@ -781,4 +789,33 @@ func truncate(value string, limit int) string {
 		return string(runes)
 	}
 	return string(runes[:limit]) + "..."
+}
+
+func limitLogEntryPayload(entry *LogEntry) {
+	entry.DisplayOutput = truncatePayloadHead(entry.DisplayOutput, maxFrontendDisplayChars)
+	entry.RawOutput = truncatePayloadTail(entry.RawOutput, maxFrontendRawChars)
+}
+
+func truncatePayloadHead(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	note := truncatedPayloadNote
+	keep := limit - len(note)
+	if keep <= 0 {
+		return value[:limit]
+	}
+	return value[:keep] + note
+}
+
+func truncatePayloadTail(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	note := truncatedPayloadNote
+	keep := limit - len(note)
+	if keep <= 0 {
+		return value[len(value)-limit:]
+	}
+	return note + value[len(value)-keep:]
 }
