@@ -22,14 +22,14 @@ import (
 const (
 	maxFrontendEventRawChars  = 12000
 	maxFrontendEventTextChars = 80000
-	frontendTruncatedNote     = "\n[内容过长，前端事件已截断；完整 raw 流请查看项目 .claude-tools/runs]\n"
+	frontendTruncatedNote     = "\n[内容过长，前端事件已截断]\n"
 	maxDisplayChars           = 2_000_000
 	maxRawChars               = 5_000_000
 	maxParserJSONLineChars    = 1_000_000
 	maxParserStateChars       = 500_000
 	maxParserMetaChars        = 20_000
 	diagnosticByteInterval    = 1_000_000
-	truncatedLogNote          = "\n\n[内容过长，内存预览已截断；完整原始流已写入项目 .claude-tools/runs/*.stream.log]\n"
+	truncatedLogNote          = "\n\n[内容过长，内存预览已截断；如需完整 raw 流，可设置 CLAUDE_TOOLS_RAW_LOG=1 后重试]\n"
 	parserTruncatedNote       = "\n[内容过长，parser 状态已截断]\n"
 )
 
@@ -152,6 +152,9 @@ func (r *Runner) Stop(ctx context.Context, runID string) error {
 }
 
 func appendRunDiagnostic(projectPath, runID, message string) {
+	if !envFlag("CLAUDE_TOOLS_DIAGNOSTICS") {
+		return
+	}
 	var ms goruntime.MemStats
 	goruntime.ReadMemStats(&ms)
 	line := fmt.Sprintf(
@@ -164,6 +167,19 @@ func appendRunDiagnostic(projectPath, runID, message string) {
 		goruntime.NumGoroutine(),
 	)
 	_ = logstore.AppendProjectLogLine(projectPath, runID, line)
+}
+
+func rawLoggingEnabled() bool {
+	return envFlag("CLAUDE_TOOLS_RAW_LOG") || envFlag("CLAUDE_TOOLS_DIAGNOSTICS")
+}
+
+func envFlag(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func createRunStreamLog(projectPath, runID string) (*os.File, string, error) {
@@ -332,14 +348,13 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 	}
 
 	if err := logstore.AppendProjectLogLine(req.ProjectPath, runID, fmt.Sprintf(
-		"start: thread=%s session=%s model=%s permission=%s prompt_bytes=%d full_prompt_bytes=%d prompt=%q",
+		"start: thread=%s session=%s model=%s permission=%s prompt_bytes=%d full_prompt_bytes=%d",
 		req.ThreadID,
 		req.ClaudeSessionID,
 		req.Model,
 		req.PermissionMode,
 		len(req.Prompt),
 		len(fullPrompt),
-		truncateForLog(req.Prompt, 120),
 	)); err != nil {
 		runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 			Type:     "stderr",
@@ -349,17 +364,22 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		})
 	}
 
-	streamLog, streamLogPath, err := createRunStreamLog(req.ProjectPath, runID)
-	if err != nil {
-		_ = logstore.AppendProjectLogLine(req.ProjectPath, runID, "raw stream log failed: "+err.Error())
-		runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
-			Type:     "stderr",
-			Text:     "创建 raw 流日志失败: " + err.Error(),
-			RunID:    runID,
-			ThreadID: req.ThreadID,
-		})
-	} else if streamLogPath != "" {
-		_ = logstore.AppendProjectLogLine(req.ProjectPath, runID, "raw stream log: "+streamLogPath)
+	var streamLog *os.File
+	streamLogPath := ""
+	if rawLoggingEnabled() {
+		var err error
+		streamLog, streamLogPath, err = createRunStreamLog(req.ProjectPath, runID)
+		if err != nil {
+			_ = logstore.AppendProjectLogLine(req.ProjectPath, runID, "raw stream log failed: "+err.Error())
+			runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
+				Type:     "stderr",
+				Text:     "创建 raw 流日志失败: " + err.Error(),
+				RunID:    runID,
+				ThreadID: req.ThreadID,
+			})
+		} else if streamLogPath != "" {
+			_ = logstore.AppendProjectLogLine(req.ProjectPath, runID, "raw stream log: "+streamLogPath)
+		}
 	}
 	if streamLog != nil {
 		defer streamLog.Close()
@@ -384,9 +404,9 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 	}
 	appendRunDiagnostic(req.ProjectPath, runID, fmt.Sprintf("phase=started pid=%d raw_stream=%q", cmd.Process.Pid, streamLogPath))
 
-	// Keep bounded previews in memory; the complete raw stream is written to disk above.
+	// Keep bounded display in memory. Raw stream logging is opt-in via CLAUDE_TOOLS_RAW_LOG=1.
 	displayPreview := newCappedTextBuffer(maxDisplayChars, truncatedLogNote)
-	rawPreview := newCappedTextBuffer(maxRawChars, truncatedLogNote)
+	rawPreview := newCappedTextBuffer(0, truncatedLogNote)
 	counters := runCounters{nextDiagnosticByteMark: diagnosticByteInterval}
 	var outputMu sync.Mutex
 
@@ -610,7 +630,7 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 	durationMS := time.Since(startTime).Milliseconds()
 	outputMu.Lock()
 	displayOutput := displayPreview.String()
-	rawOutput := rawStreamText(streamLogPath) + rawPreview.String()
+	rawOutput := rawStreamText(streamLogPath)
 	finalCounters := counters
 	rawKeptBytes := rawPreview.KeptBytes()
 	rawSeenBytes := rawPreview.SeenBytes()
@@ -735,8 +755,9 @@ type streamParser struct {
 }
 
 type toolTrace struct {
-	name  string
-	input *cappedTextBuffer
+	name   string
+	input  *cappedTextBuffer
+	status string
 }
 
 type tokenUsage struct {
@@ -895,7 +916,7 @@ func (p *streamParser) extract(line string) (string, string) {
 				"truncated":    true,
 				"bytes":        len(line),
 			}
-			return "tool-result", "[工具结果过长，已跳过解析；完整原始行已写入 raw 流日志]\n"
+			return "tool-result", "[工具结果过长，已跳过解析；如需完整 raw 流，可设置 CLAUDE_TOOLS_RAW_LOG=1 后重试]\n"
 		}
 		p.warn("skipped oversized JSON line bytes=%s", formatBytes(uint64(len(line))))
 		return "", ""
@@ -949,6 +970,11 @@ func (p *streamParser) extract(line string) (string, string) {
 					if tool.input.Append(partial) {
 						p.warn("tool input meta exceeded %s for tool=%s block=%d", formatBytes(uint64(maxParserMetaChars)), tool.name, idx)
 					}
+					if status := describeToolUse(tool.name, tool.input.String()); status != "" && status != tool.status {
+						tool.status = status
+						p.lastMeta = map[string]interface{}{"phase": "update", "name": tool.name}
+						return "tool-start", status
+					}
 				}
 			}
 			return "", ""
@@ -971,7 +997,11 @@ func (p *streamParser) extract(line string) (string, string) {
 				}
 				p.tools[idx] = tool
 				p.lastMeta = map[string]interface{}{"phase": "start", "name": name}
-				return "tool-start", describeToolStart(name)
+				tool.status = describeToolUse(name, tool.input.String())
+				if tool.status == "" {
+					tool.status = describeToolStart(name)
+				}
+				return "tool-start", tool.status
 			}
 			if cbType == "thinking" || cbType == "redacted_thinking" {
 				p.thinking[idx] = true

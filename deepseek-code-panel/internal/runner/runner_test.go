@@ -44,6 +44,17 @@ func TestStreamParserKeepsFinalUsageWhenMessageUsageIsPartial(t *testing.T) {
 	}
 }
 
+func TestStreamParserDescribesToolTarget(t *testing.T) {
+	parser := newStreamParser()
+	eventType, display := parser.extract(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Read","input":{"file_path":"internal/runner/runner.go"}}}`)
+	if eventType != "tool-start" {
+		t.Fatalf("expected tool-start, got %q", eventType)
+	}
+	if !strings.Contains(display, "internal/runner/runner.go") {
+		t.Fatalf("expected tool target in display, got %q", display)
+	}
+}
+
 func TestStreamParserSuppressesLargeDuplicateFinalResult(t *testing.T) {
 	parser := newStreamParser()
 	parser.extract(`{"type":"message_start"}`)

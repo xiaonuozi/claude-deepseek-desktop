@@ -18,7 +18,7 @@ const (
 	maxFrontendDisplayChars  = 500000
 	maxFrontendRawChars      = 700000
 	maxTokenBackfillRawChars = 8_000_000
-	truncatedPayloadNote     = "\n\n[内容过长，界面仅显示截断预览；完整 raw 流请查看项目 .claude-tools/runs]\n"
+	truncatedPayloadNote     = "\n\n[内容过长，界面仅显示截断预览]\n"
 )
 
 var (
@@ -494,13 +494,14 @@ func appendProjectArtifacts(entry LogEntry) error {
 	}
 
 	summary := fmt.Sprintf(
-		"finish: thread=%s session=%s exit_code=%d duration=%dms model=%s prompt=%q",
+		"finish: thread=%s session=%s exit_code=%d duration=%dms model=%s tokens=%d/%d",
 		entry.ThreadID,
 		entry.ClaudeSessionID,
 		entry.ExitCode,
 		entry.DurationMS,
 		entry.Model,
-		truncate(entry.Prompt, 120),
+		entry.InputTokens,
+		entry.OutputTokens,
 	)
 	return AppendProjectLogLine(entry.ProjectPath, entry.ID, summary)
 }
