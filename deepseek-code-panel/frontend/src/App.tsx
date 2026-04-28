@@ -27,11 +27,16 @@ type OutputLine = {
 };
 
 type LogEntry = logstore.LogEntry;
-type ViewMode = 'output' | 'raw';
+type ActivityItem = {
+  type: string;
+  text: string;
+  meta?: Record<string, any>;
+};
 type OutputSegment = {
   type: string;
   text: string;
   meta?: Record<string, any>;
+  items?: ActivityItem[];
 };
 type ThreadBuffers = {
   outputLines: OutputLine[];
@@ -132,7 +137,12 @@ const MAX_DISPLAY_CHARS = 500_000;
 const MAX_THINKING_CHARS = 80_000;
 const MAX_TOOL_RESULT_CHARS = 120_000;
 const SCROLL_BOTTOM_THRESHOLD = 120;
-const TRUNCATED_NOTE = '\n\n[内容过长，界面已截断；完整 raw 流请查看项目 .claude-tools/runs]\n';
+const TRUNCATED_NOTE = '\n\n[内容过长，界面已截断]\n';
+
+function compactText(value: string, max = 96): string {
+  const text = value.replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
 
 function appendLimitedText(current: string, addition: string, limit: number): string {
   if (!addition) return current;
@@ -189,7 +199,7 @@ function appendRawLine(lines: string[], line: string): string[] {
     start -= 1;
   }
   if (start <= 0) return next;
-  return [`[Raw 输出过长，已隐藏前 ${start} 行；完整 raw 流请查看项目 .claude-tools/runs]`, ...next.slice(start)];
+  return [`[Raw 输出过长，已隐藏前 ${start} 行]`, ...next.slice(start)];
 }
 
 const MODELS = [
@@ -205,11 +215,35 @@ const PERMISSION_MODES = [
   { value: 'bypassPermissions', label: '完全访问权限' },
 ];
 
+function isActivityType(type: string): boolean {
+  return type === 'status' || type === 'system' || type === 'done' ||
+    type === 'thinking-start' || type === 'thinking-delta' || type === 'thinking-end' ||
+    type === 'thinking-block' || type === 'tool-start' || type === 'tool-end' || type === 'tool-result';
+}
+
+function sameActivityItem(a: ActivityItem | undefined, b: ActivityItem): boolean {
+  if (!a) return false;
+  return a.type === b.type && a.text === b.text && a.meta?.name === b.meta?.name;
+}
+
+function buildActivitySummary(items: ActivityItem[]): string {
+  const status = [...items].reverse().find((item) => item.type === 'status' || item.type === 'system');
+  if (status?.meta?.duration_ms !== undefined) {
+    return `已处理 · ${buildRunStats(status.meta.duration_ms, status.meta.input_tokens, status.meta.output_tokens)}`;
+  }
+  const latest = [...items].reverse().find((item) => item.type !== 'status' && item.type !== 'system' && item.type !== 'thinking-block' && item.text.trim());
+  if (latest) {
+    return `处理中 · ${compactText(latest.text)}`;
+  }
+  return '处理中';
+}
+
 function buildOutputSegments(lines: OutputLine[]): OutputSegment[] {
   const segments: OutputSegment[] = [];
   let markdown = '';
   let thinkingBuf = '';
   let inThinking = false;
+  let activityItems: ActivityItem[] = [];
 
   const flushMarkdown = () => {
     if (markdown.trim()) {
@@ -220,10 +254,26 @@ function buildOutputSegments(lines: OutputLine[]): OutputSegment[] {
 
   const flushThinking = () => {
     if (inThinking && thinkingBuf.trim()) {
-      segments.push({ type: 'thinking-block', text: thinkingBuf.trim() });
+      appendActivity({ type: 'thinking-block', text: thinkingBuf.trim() });
     }
     thinkingBuf = '';
     inThinking = false;
+  };
+
+  const flushActivity = () => {
+    if (!activityItems.length) return;
+    segments.push({
+      type: 'activity',
+      text: buildActivitySummary(activityItems),
+      items: activityItems,
+    });
+    activityItems = [];
+  };
+
+  const appendActivity = (item: ActivityItem) => {
+    if (!item.text.trim() && item.type !== 'status' && item.type !== 'system') return;
+    if (sameActivityItem(activityItems[activityItems.length - 1], item)) return;
+    activityItems.push(item);
   };
 
   for (const line of lines) {
@@ -233,28 +283,38 @@ function buildOutputSegments(lines: OutputLine[]): OutputSegment[] {
       continue;
     }
     if (line.type === 'thinking-start') {
+      flushMarkdown();
+      appendActivity({ type: 'thinking-start', text: line.text || '深度思考中…', meta: line.meta });
       inThinking = true;
       continue;
     }
     if (line.type === 'thinking-end') {
       flushThinking();
+      appendActivity({ type: 'thinking-end', text: line.text || '深度思考结束', meta: line.meta });
+      continue;
+    }
+    if (isActivityType(line.type)) {
+      flushMarkdown();
+      if (line.type === 'tool-start' || line.type === 'tool-end' || line.type === 'tool-result' || line.type === 'status' || line.type === 'system' || line.type === 'done') {
+        appendActivity({ type: line.type, text: line.text, meta: line.meta });
+      }
       continue;
     }
     if (line.type === 'display') {
+      flushThinking();
+      flushActivity();
       markdown += line.text;
       continue;
     }
     flushMarkdown();
     flushThinking();
-    if (line.type === 'tool-start' || line.type === 'tool-end') {
-      segments.push({ type: line.type, text: line.text, meta: line.meta });
-    } else {
-      segments.push({ type: line.type, text: line.text });
-    }
+    flushActivity();
+    segments.push({ type: line.type, text: line.text, meta: line.meta });
   }
 
   flushMarkdown();
   flushThinking();
+  flushActivity();
   return segments;
 }
 
@@ -264,7 +324,21 @@ type MarkdownBlock =
   | { type: 'code'; language: string; text: string }
   | { type: 'ul'; items: string[] }
   | { type: 'ol'; items: string[] }
-  | { type: 'quote'; text: string };
+  | { type: 'quote'; text: string }
+  | { type: 'table'; headers: string[]; rows: string[][] };
+
+function splitTableRow(line: string): string[] {
+  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
+}
+
+function isTableSeparator(line: string): boolean {
+  const cells = splitTableRow(line);
+  return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function looksLikeTableRow(line: string): boolean {
+  return line.includes('|') && splitTableRow(line).length > 1;
+}
 
 function parseMarkdown(text: string): MarkdownBlock[] {
   const lines = text.replace(/\r\n/g, '\n').split('\n');
@@ -290,6 +364,18 @@ function parseMarkdown(text: string): MarkdownBlock[] {
       }
       if (i < lines.length) i += 1;
       blocks.push({ type: 'code', language, text: code.join('\n') });
+      continue;
+    }
+
+    if (looksLikeTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      const headers = splitTableRow(line);
+      const rows: string[][] = [];
+      i += 2;
+      while (i < lines.length && looksLikeTableRow(lines[i]) && lines[i].trim()) {
+        rows.push(splitTableRow(lines[i]));
+        i += 1;
+      }
+      blocks.push({ type: 'table', headers, rows });
       continue;
     }
 
@@ -336,6 +422,7 @@ function parseMarkdown(text: string): MarkdownBlock[] {
       lines[i].trim() &&
       !/^```/.test(lines[i]) &&
       !/^(#{1,3})\s+/.test(lines[i]) &&
+      !(looksLikeTableRow(lines[i]) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) &&
       !/^\s*[-*]\s+/.test(lines[i]) &&
       !/^\s*\d+\.\s+/.test(lines[i]) &&
       !/^\s*>\s?/.test(lines[i])
@@ -389,9 +476,77 @@ function MarkdownMessage({ text }: { text: string }) {
         if (block.type === 'quote') {
           return <blockquote key={index}>{renderInline(block.text, `q-${index}`)}</blockquote>;
         }
+        if (block.type === 'table') {
+          return (
+            <div key={index} className="markdown-table-wrap">
+              <table>
+                <thead>
+                  <tr>{block.headers.map((cell, cellIndex) => <th key={cellIndex}>{renderInline(cell, `th-${index}-${cellIndex}`)}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {block.headers.map((_, cellIndex) => <td key={cellIndex}>{renderInline(row[cellIndex] || '', `td-${index}-${rowIndex}-${cellIndex}`)}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+        }
         return <p key={index}>{renderInline(block.text, `p-${index}`)}</p>;
       })}
     </div>
+  );
+}
+
+function FolderIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path d="M2.5 5.5A2.5 2.5 0 0 1 5 3h3.1c.63 0 1.22.3 1.6.8l.72.95H15A2.5 2.5 0 0 1 17.5 7.25v6.25A2.5 2.5 0 0 1 15 16H5a2.5 2.5 0 0 1-2.5-2.5v-8Z" />
+      <path d="M2.9 7h14.2" />
+    </svg>
+  );
+}
+
+function ActivityGroup({ segment }: { segment: OutputSegment }) {
+  const items = segment.items || [];
+  return (
+    <details className="activity-fold">
+      <summary>
+        <span className={segment.text.startsWith('已处理') ? 'activity-dot done' : 'activity-dot'} />
+        <span>{segment.text}</span>
+        <small>{items.length} 项</small>
+      </summary>
+      <div className="activity-list">
+        {items.map((item, index) => {
+          if (item.type === 'thinking-block') {
+            return (
+              <details key={`activity-thinking-${index}`} className="thinking-fold">
+                <summary>深度思考内容</summary>
+                <pre className="thinking-body">{item.text}</pre>
+              </details>
+            );
+          }
+          if (item.type === 'tool-result') {
+            return (
+              <details key={`activity-result-${index}`} className="tool-result-fold">
+                <summary>查看工具结果</summary>
+                <pre className="tool-result-body">{item.text}</pre>
+              </details>
+            );
+          }
+          const toolName = item.meta?.name || (item.type.startsWith('tool-') ? 'TOOL' : '');
+          const isDone = item.type === 'tool-end';
+          return (
+            <div key={`activity-${index}`} className={`activity-item ${item.type}`}>
+              {toolName && <span className={isDone ? 'tool-badge end' : 'tool-badge'}>{toolName}</span>}
+              <span className="activity-text">{item.text}</span>
+            </div>
+          );
+        })}
+      </div>
+    </details>
   );
 }
 
@@ -407,7 +562,6 @@ function App() {
 
   const [outputLines, setOutputLines] = useState<OutputLine[]>([]);
   const [rawOutput, setRawOutput] = useState<string[]>([]);
-  const [viewMode, setViewMode] = useState<ViewMode>('output');
   const [error, setError] = useState('');
   const [claudeVersion, setClaudeVersion] = useState('');
   const [showSettings, setShowSettings] = useState(false);
@@ -501,7 +655,6 @@ function App() {
     setRawOutput(buffers.rawOutput);
     setError(buffers.error);
     setActiveSessionID(buffers.sessionID);
-    setViewMode('output');
   }, [blankThreadBuffers]);
 
   const isNearBottom = useCallback((element: HTMLDivElement) => (
@@ -637,14 +790,13 @@ function App() {
         setShowScrollBottom(true);
       }
     }
-  }, [outputLines, rawOutput, viewMode, scrollToBottom]);
+  }, [outputLines, rawOutput, scrollToBottom]);
 
   const truncate = (value: string, size: number) => (
     value && value.length > size ? value.slice(0, size - 1) + '…' : value
   );
 
   const effectiveModel = customModel.trim() || model;
-  const selectedModelLabel = MODELS.find((item) => item.value === model)?.label || effectiveModel;
   const selectedPermissionLabel = PERMISSION_MODES.find((item) => item.value === permissionMode)?.label || permissionMode;
   const projectName = projectPath ? projectPath.split(/[\\/]/).filter(Boolean).pop() || projectPath : 'Claude Tools';
   const pendingThreadIDs = new Set(Object.keys(pendingLogs));
@@ -677,7 +829,6 @@ function App() {
         setShowProjectThreads(true);
         switchToThread(createLocalID('new'));
         setPrompt('');
-        setViewMode('output');
       }
     } catch (err: any) {
       const msg = '选择目录失败: ' + err;
@@ -695,7 +846,6 @@ function App() {
       setError('');
       setActiveSessionID('');
     }
-    setViewMode('output');
   };
 
   const handleNewTask = () => {
@@ -755,7 +905,6 @@ function App() {
         setActiveSessionID('');
         setOutputLines([]);
         setRawOutput([]);
-        setViewMode('output');
       }
       await loadRecentLogs();
     } catch (err: any) {
@@ -825,7 +974,6 @@ function App() {
 
     log('INFO', `doStartRun: thread=${threadID} run=${runID} project=${projectPath} model=${effectiveModel} mode=${mode}`);
 
-    setViewMode('output');
     setPrompt('');
 
     try {
@@ -891,7 +1039,6 @@ function App() {
       setActiveThreadID(threadID);
       setActiveSessionID(liveBuffers.sessionID || log.claude_session_id || '');
       setProjectPath(log.project_path || projectPath);
-      setViewMode('output');
       setOutputLines(liveBuffers.outputLines);
       setRawOutput(liveBuffers.rawOutput);
       setError(liveBuffers.error);
@@ -937,7 +1084,6 @@ function App() {
     setActiveThreadID(threadID);
     setActiveSessionID(nextBuffers.sessionID);
     setProjectPath(lastLog.project_path || log.project_path);
-    setViewMode('output');
     setRawOutput(nextBuffers.rawOutput);
     setError(nextBuffers.error);
     setOutputLines(nextBuffers.outputLines);
@@ -986,7 +1132,7 @@ function App() {
           <div className="project-row-wrap">
             <button className="project-row" onClick={handleToggleProjectThreads} title={showProjectThreads ? '收起线程' : '展开线程'}>
               <span className="project-toggle">{showProjectThreads ? '▾' : '▸'}</span>
-              <span className="folder-icon">▱</span>
+              <span className="folder-icon"><FolderIcon /></span>
               <span className="project-name">{projectName}</span>
             </button>
             <button className="project-new-thread" onClick={handleProjectThread} title={projectPath ? '开启新线程' : '选择项目目录'}>+</button>
@@ -1038,21 +1184,7 @@ function App() {
           <div className="header-actions">
             {activeThreadRunning ? (
               <button className="pill-button danger" onClick={handleStop}>停止</button>
-            ) : (
-              <button className="icon-button" onClick={() => doStartRun(permissionMode)} title="运行">▷</button>
-            )}
-            <button className="model-chip" onClick={() => setShowSettings(true)} title={effectiveModel}>
-              <span className="chip-logo">◆</span>
-              <span>{selectedModelLabel}</span>
-            </button>
-            <button className="pill-button" onClick={() => doStartRun(permissionMode)} disabled={activeThreadRunning}>
-              提交⌄
-            </button>
-            <span className="divider" />
-            <button className={viewMode === 'output' ? 'icon-button active' : 'icon-button'} onClick={() => setViewMode('output')} title="输出">▱</button>
-            <button className={viewMode === 'raw' ? 'icon-button active' : 'icon-button'} onClick={() => setViewMode('raw')} title="Raw">⌗</button>
-            <span className="run-stat ok">+{rawOutput.length}</span>
-            <span className="run-stat bad">-{outputLines.filter((line) => line.type === 'stderr' || line.type === 'error').length}</span>
+            ) : null}
           </div>
         </header>
 
@@ -1060,9 +1192,7 @@ function App() {
           <div className="conversation-lane">
             {error && <div className="error-banner">{error}{logPath ? <><br/><small>日志路径: {logPath}</small></> : ''}</div>}
 
-            {viewMode === 'raw' ? (
-              <pre className="raw-block">{rawOutput.length ? rawOutput.join('\n') : '(empty)'}</pre>
-            ) : outputLines.length === 0 && !error ? (
+            {outputLines.length === 0 && !error ? (
               <div className="empty-thread">
                 <div className="empty-title">选择项目后开始运行</div>
                 <div className="empty-subtitle">{projectPath || '左侧选择项目目录，然后在下方输入任务'}</div>
@@ -1077,6 +1207,9 @@ function App() {
                   {outputSegments.map((segment, index) => {
                     if (segment.type === 'display') {
                       return <MarkdownMessage key={`md-${index}`} text={segment.text} />;
+                    }
+                    if (segment.type === 'activity') {
+                      return <ActivityGroup key={`activity-${index}`} segment={segment} />;
                     }
                     if (segment.type === 'user') {
                       return <div key={`user-${index}`} className="user-message">{segment.text}</div>;
@@ -1166,8 +1299,8 @@ function App() {
           </div>
 
           <div className="workspace-status">
-            <button>▱ 本地模式⌄</button>
-            <button>⌁ master⌄</button>
+            <span>本地模式</span>
+            <span>master</span>
             <span>{claudeVersion || 'Claude CLI'}</span>
             <span>{selectedPermissionLabel}</span>
           </div>
@@ -1226,7 +1359,6 @@ function App() {
 
             <div className="settings-meta">
               <div><span>Project</span><strong title={projectPath}>{projectName}</strong></div>
-              <div><span>Raw lines</span><strong>{rawOutput.length}</strong></div>
               <div><span>Status</span><strong>{isRunning ? 'Running' : 'Idle'}</strong></div>
             </div>
           </aside>
