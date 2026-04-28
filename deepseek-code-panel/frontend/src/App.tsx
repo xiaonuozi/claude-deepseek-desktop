@@ -7,6 +7,7 @@ import {
   StopRun,
   GetRecentLogs,
   GetThreadLogs,
+  DeleteThreads,
   WriteAppLog,
   GetLogPath,
 } from '../wailsjs/go/main/App';
@@ -245,6 +246,7 @@ function App() {
   const [claudeVersion, setClaudeVersion] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [logPath, setLogPath] = useState('');
+  const [showAllThreads, setShowAllThreads] = useState(false);
 
   const [recentLogs, setRecentLogs] = useState<LogEntry[]>([]);
   const [activeThreadID, setActiveThreadID] = useState('');
@@ -309,6 +311,7 @@ function App() {
         if (event.type === 'done') {
           log('INFO', 'run-event done');
           setIsRunning(false);
+          setIsComposing(false);
           loadRecentLogs();
         }
       } catch (err: any) {
@@ -354,11 +357,12 @@ function App() {
       if (dir) {
         log('INFO', 'handleSelectDir: selected ' + dir);
         setProjectPath(dir);
-        setActiveThreadID('');
+        setActiveThreadID(createLocalID('new'));
         setActiveSessionID('');
         setOutputLines([]);
         setRawOutput([]);
         setPrompt('');
+        setIsComposing(false);
         setError('');
         setViewMode('output');
       }
@@ -375,12 +379,14 @@ function App() {
     setError('');
     setActiveThreadID('');
     setActiveSessionID('');
+    setIsComposing(false);
     setViewMode('output');
   };
 
   const handleNewTask = () => {
     handleClear();
     setPrompt('');
+    setActiveThreadID(createLocalID('new'));
   };
 
   const handleProjectThread = async () => {
@@ -391,9 +397,10 @@ function App() {
     setOutputLines([]);
     setRawOutput([]);
     setError('');
-    setActiveThreadID('');
+    setActiveThreadID(createLocalID('new'));
     setActiveSessionID('');
     setPrompt('');
+    setIsComposing(false);
     setViewMode('output');
   };
 
@@ -406,15 +413,37 @@ function App() {
         return;
       }
       setProjectPath(threadProjectPath);
-      setActiveThreadID('');
+      setActiveThreadID(createLocalID('new'));
       setActiveSessionID('');
       setOutputLines([]);
       setRawOutput([]);
       setPrompt('');
+      setIsComposing(false);
       setError('');
       setViewMode('output');
     } catch (err: any) {
       log('ERROR', 'handleNewThreadFromLog error: ' + String(err));
+    }
+  };
+
+  const handleDeleteThread = async (logEntry: LogEntry, event: React.MouseEvent) => {
+    event.stopPropagation();
+    const threadID = logEntry.thread_id || logEntry.id;
+    if (!window.confirm(`确定删除此线程的所有记录？\n\n${logEntry.prompt?.slice(0, 60) || '(empty)'}`)) return;
+    try {
+      await DeleteThreads(threadID);
+      log('INFO', 'handleDeleteThread: deleted thread ' + threadID);
+      if ((activeThreadID || activeSessionID) && activeThreadID === threadID) {
+        setActiveThreadID('');
+        setActiveSessionID('');
+        setOutputLines([]);
+        setRawOutput([]);
+        setViewMode('output');
+      }
+      loadRecentLogs();
+    } catch (err: any) {
+      log('ERROR', 'handleDeleteThread error: ' + String(err));
+      setError('删除失败: ' + err);
     }
   };
 
@@ -427,7 +456,7 @@ function App() {
     if (!trimmedPrompt) { setError('请输入任务内容'); return; }
     if (isRunning) { setError('已有任务正在运行'); return; }
 
-    const threadID = activeThreadID || createLocalID('thread');
+    const threadID = (activeThreadID && !activeThreadID.startsWith('new-')) ? activeThreadID : createLocalID('thread');
     const runID = createLocalID('run');
 
     log('INFO', `doStartRun: thread=${threadID} run=${runID} project=${projectPath} model=${effectiveModel} mode=${mode}`);
@@ -443,6 +472,7 @@ function App() {
     setViewMode('output');
     setIsRunning(true);
     setPrompt('');
+    setIsComposing(false);
 
     try {
       await StartRun({
@@ -544,20 +574,30 @@ function App() {
 
         <section className="sidebar-group history-group">
           <div className="run-list">
-            {recentLogs.length === 0 ? (
+            {activeThreadID.startsWith('new-') && (
+              <button className="history-row active" onClick={handleNewTask}>
+                <span>新对话</span>
+              </button>
+            )}
+            {recentLogs.length === 0 && !activeThreadID.startsWith('new-') ? (
               <div className="empty-list">暂无聊天</div>
             ) : (
-              recentLogs.map((log) => (
+              (showAllThreads ? recentLogs : recentLogs.slice(0, 5)).map((log) => (
                 <button
                   key={log.id}
                   className={`history-row ${(log.thread_id || log.id) === activeThreadID ? 'active' : ''}`}
-                  onClick={() => handleNewThreadFromLog(log)}
-                  onDoubleClick={() => handleViewLog(log)}
+                  onClick={() => handleViewLog(log)}
                 >
                   <span>{truncate(log.prompt || '(empty prompt)', 28)}</span>
                   <time>{formatAge(log.created_at)}</time>
+                  <span className="delete-thread" onClick={(e) => handleDeleteThread(log, e)} title="删除线程">×</span>
                 </button>
               ))
+            )}
+            {recentLogs.length > 5 && (
+              <button className="expand-toggle" onClick={() => setShowAllThreads(!showAllThreads)}>
+                {showAllThreads ? '收起' : `展开更多 (${recentLogs.length - 5})`}
+              </button>
             )}
           </div>
         </section>
@@ -636,21 +676,14 @@ function App() {
             <textarea
               value={prompt}
               onChange={(event) => {
-                try {
-                  if (!isComposing) setPrompt(event.target.value);
-                } catch (err: any) {
-                  log('ERROR', 'textarea onChange: ' + String(err));
-                }
+                if (!isComposing) setPrompt(event.target.value);
               }}
-              onCompositionStart={() => { try { setIsComposing(true); } catch (err: any) { log('ERROR', 'compositionStart: ' + String(err)); } }}
+              onCompositionStart={() => setIsComposing(true)}
               onCompositionEnd={(event) => {
-                try {
-                  setIsComposing(false);
-                  setPrompt((event.target as HTMLTextAreaElement).value);
-                } catch (err: any) {
-                  log('ERROR', 'compositionEnd: ' + String(err));
-                }
+                setIsComposing(false);
+                setPrompt((event.target as HTMLTextAreaElement).value);
               }}
+              onBlur={() => setIsComposing(false)}
               placeholder="要求后续变更"
               disabled={isRunning}
             />

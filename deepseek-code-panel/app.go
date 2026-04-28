@@ -168,3 +168,12 @@ func (a *App) GetThreadLogs(threadID string) ([]logstore.LogEntry, error) {
 	}
 	return logstore.GetThreadLogs(threadID)
 }
+
+// DeleteThreads removes all run logs for the given thread.
+func (a *App) DeleteThreads(threadID string) error {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return fmt.Errorf("线程 ID 不能为空")
+	}
+	return logstore.DeleteThreads(threadID)
+}

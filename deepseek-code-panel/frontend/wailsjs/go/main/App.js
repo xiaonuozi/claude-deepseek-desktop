@@ -6,6 +6,10 @@ export function CheckClaudeInstalled() {
   return window['go']['main']['App']['CheckClaudeInstalled']();
 }
 
+export function DeleteThreads(arg1) {
+  return window['go']['main']['App']['DeleteThreads'](arg1);
+}
+
 export function GetLogPath() {
   return window['go']['main']['App']['GetLogPath']();
 }

@@ -5,6 +5,8 @@ import {runner} from '../models';
 
 export function CheckClaudeInstalled():Promise<string>;
 
+export function DeleteThreads(arg1:string):Promise<void>;
+
 export function GetLogPath():Promise<string>;
 
 export function GetRecentLogs(arg1:number):Promise<Array<logstore.LogEntry>>;

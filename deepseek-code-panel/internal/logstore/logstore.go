@@ -308,6 +308,18 @@ func (ls *LogStore) GetLogDir() string {
 	return ls.dir
 }
 
+// DeleteThreads removes all runs belonging to the given thread.
+func (ls *LogStore) DeleteThreads(threadID string) error {
+	if ls == nil || ls.db == nil {
+		return fmt.Errorf("日志库未初始化")
+	}
+	_, err := ls.db.Exec(`DELETE FROM runs WHERE COALESCE(NULLIF(thread_id, ''), id) = ?`, threadID)
+	if err != nil {
+		return fmt.Errorf("删除线程日志失败: %w", err)
+	}
+	return nil
+}
+
 func insertEntry(db *sql.DB, entry LogEntry) error {
 	if strings.TrimSpace(entry.ThreadID) == "" {
 		entry.ThreadID = entry.ID
@@ -363,6 +375,15 @@ func GetLatestSessionID(threadID string) (string, error) {
 		return "", err
 	}
 	return store.GetLatestSessionID(threadID)
+}
+
+// DeleteThreads removes all runs belonging to the given thread from the global store.
+func DeleteThreads(threadID string) error {
+	store, err := globalStore()
+	if err != nil {
+		return err
+	}
+	return store.DeleteThreads(threadID)
 }
 
 func appendProjectArtifacts(entry LogEntry) error {
