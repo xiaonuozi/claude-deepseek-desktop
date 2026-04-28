@@ -1,6 +1,6 @@
 # DeepSeek Code Panel
 
-本地 AI 编程助手桌面应用。基于 Wails v2 + Go + React 构建，调用 `claude` CLI 连接 DeepSeek Anthropic API。
+本地 AI 编程助手桌面应用。基于 Wails v2 + Go + React 构建，通过 `claude` CLI 连接 DeepSeek Anthropic API，提供多线程对话、流式输出、SQLite 持久化等功能。
 
 ---
 
@@ -22,7 +22,7 @@ claude --version
 1. 打开应用，点击左下角「设置」
 2. 填入 **DeepSeek API Key**（在 [platform.deepseek.com](https://platform.deepseek.com) 获取）
 3. Base URL 默认为 `https://api.deepseek.com/anthropic`，一般无需修改
-4. 选择模型：DeepSeek V4 Pro / V4 Flash / 自定义
+4. 选择模型：**DeepSeek V4 Pro** / **V4 Flash** / **自定义模型**（输入任意模型名）
 5. 设置 **Language**（默认 `中文`）：每次提交任务时会自动在 Prompt 前追加语言指令
 
 配置会自动保存到本地 SQLite 数据库，下次打开无需重新输入。
@@ -70,9 +70,9 @@ claude --version
 
 ### 输出视图
 
-- **输出视图**（`▱`）：格式化显示
+- **格式化视图**（`▱`）：
   - Markdown 渲染、代码高亮
-  - 工具调用带彩色标签（`Read` `Write` `Edit` `Bash` 等），一目了然
+  - 工具调用带彩色标签（`Read` `Write` `Edit` `Bash` `Grep` 等）
   - 工具返回结果可折叠展开（`查看结果`）
   - 深度思考内容可折叠，默认收起
   - 在 model/mode/time 行显示耗时和 token 用量（例如 `耗时: 12s / token: 输入 1,523 / 输出 487`）
@@ -81,6 +81,10 @@ claude --version
 ### 停止任务
 
 点击右上角红色「停止」按钮，仅停止当前线程的任务，不影响其他线程。
+
+### 会话续接
+
+同一线程的下一次任务会自动使用 `--resume` 续接之前的 Claude 会话，保留上下文记忆。
 
 ### 注意事项
 
@@ -91,6 +95,17 @@ claude --version
 ```
 
 避免把对话记录提交到项目仓库。
+
+---
+
+## 环境变量（调试与诊断）
+
+以下环境变量用于开发调试或问题排查，正常使用无需设置：
+
+| 变量 | 说明 |
+|------|------|
+| `CLAUDE_TOOLS_RAW_LOG=1` | 将完整的 stream-json 原始输出写入磁盘文件（位于项目 `.claude-tools/` 目录下） |
+| `CLAUDE_TOOLS_DIAGNOSTICS=1` | 启用诊断日志（同时也会启用 Raw 日志），记录每个阶段的字节量、截断信息等，用于排查 OOM 或性能问题 |
 
 ---
 
@@ -113,6 +128,16 @@ cd frontend && npm install && cd ..
 wails dev
 ```
 
+开发模式下建议设置环境变量启用诊断日志：
+
+```bash
+# PowerShell
+$env:CLAUDE_TOOLS_DIAGNOSTICS = "1"; wails dev
+
+# Bash
+CLAUDE_TOOLS_DIAGNOSTICS=1 wails dev
+```
+
 ### 构建
 
 ```bash
@@ -125,11 +150,13 @@ wails build
 
 ```
 frontend/src/App.tsx    — React UI（状态管理、Markdown/思考块/工具调用渲染、事件流、项目级线程筛选）
+frontend/src/style.css  — 全部样式
 app.go                  — Wails 绑定（项目选择、启停、日志查询、线程删除、设置读写、应用日志）
 command_windows.go      — Windows 平台子进程配置（隐藏窗口）
 command_other.go        — 其他平台子进程配置
-internal/runner/        — claude CLI 进程管理、stream-json 解析（thinking/tool/usage）、panic 恢复、多任务并发调度、语言注入
-internal/logstore/      — SQLite 持久化（运行记录 + 设置）、旧 JSONL 迁移、token 回填
+internal/runner/        — claude CLI 进程管理、stream-json 流式解析（thinking/tool/usage/token）、
+                          panic 恢复、并发控制、语言注入、内存限流（cappedTextBuffer）、诊断日志
+internal/logstore/      — SQLite 持久化（运行记录 + 设置）、Schema 自动迁移、旧 JSONL 迁移、Token 回填
 ```
 
 ### 数据存储
@@ -141,13 +168,20 @@ internal/logstore/      — SQLite 持久化（运行记录 + 设置）、旧 JS
 - 旧版本 JSONL 格式（`runs.jsonl`）在启动时自动迁移至 SQLite
 - Token 用量在迁移时自动从原始输出中提取并回填
 
-### 日志
+### 日志文件
 
 | 文件 | 内容 |
 |------|------|
 | `runs.db` | SQLite 数据库（运行记录 + 设置） |
 | `app.log` | 应用运行日志（含崩溃堆栈） |
 | `runs.jsonl` | 旧版 JSONL 格式（迁移后保留） |
+
+### 内存管理
+
+- 展示文本（Markdown）的预览上限为 **2MB**，Raw 输出的预览上限为 **5MB**，超出部分在内存中截断
+- 原始流日志默认不写磁盘，仅在设置 `CLAUDE_TOOLS_RAW_LOG=1` 后输出
+- 前端事件的单次推送有独立的字符上限，防止 UI 卡顿
+- 通过 `CLAUDE_TOOLS_DIAGNOSTICS=1` 可监控各阶段的字节量和截断情况，帮助排查 OOM
 
 ### 隐私与安全
 
