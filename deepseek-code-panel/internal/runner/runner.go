@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	goruntime "runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -20,13 +22,92 @@ import (
 const (
 	maxFrontendEventRawChars  = 12000
 	maxFrontendEventTextChars = 80000
-	frontendTruncatedNote     = "\n[内容过长，前端事件已截断；完整内容已写入本地日志]\n"
+	frontendTruncatedNote     = "\n[内容过长，前端事件已截断；完整 raw 流请查看项目 .claude-tools/runs]\n"
+	maxDisplayChars           = 2_000_000
+	maxRawChars               = 5_000_000
+	maxParserJSONLineChars    = 1_000_000
+	maxParserStateChars       = 500_000
+	maxParserMetaChars        = 20_000
+	diagnosticByteInterval    = 1_000_000
+	truncatedLogNote          = "\n\n[内容过长，内存预览已截断；完整原始流已写入项目 .claude-tools/runs/*.stream.log]\n"
+	parserTruncatedNote       = "\n[内容过长，parser 状态已截断]\n"
 )
 
 // Runner manages concurrent claude CLI processes.
 type Runner struct {
 	mu   sync.Mutex
 	runs map[string]context.CancelFunc // runID → cancel
+}
+
+type cappedTextBuffer struct {
+	builder   strings.Builder
+	limit     int
+	note      string
+	seenBytes int
+	truncated bool
+}
+
+func newCappedTextBuffer(limit int, note string) *cappedTextBuffer {
+	return &cappedTextBuffer{limit: limit, note: note}
+}
+
+func (b *cappedTextBuffer) Append(value string) bool {
+	if value == "" {
+		return false
+	}
+	b.seenBytes += len(value)
+	if b.limit <= 0 || b.truncated {
+		return false
+	}
+	if b.builder.Len()+len(value) <= b.limit {
+		b.builder.WriteString(value)
+		return false
+	}
+	keep := b.limit - b.builder.Len() - len(b.note)
+	if keep > 0 {
+		if keep > len(value) {
+			keep = len(value)
+		}
+		b.builder.WriteString(value[:keep])
+	}
+	if b.builder.Len()+len(b.note) <= b.limit {
+		b.builder.WriteString(b.note)
+	}
+	b.truncated = true
+	return true
+}
+
+func (b *cappedTextBuffer) String() string {
+	return b.builder.String()
+}
+
+func (b *cappedTextBuffer) SeenBytes() int {
+	return b.seenBytes
+}
+
+func (b *cappedTextBuffer) KeptBytes() int {
+	return b.builder.Len()
+}
+
+func (b *cappedTextBuffer) Truncated() bool {
+	return b.truncated
+}
+
+type runCounters struct {
+	stdoutLines            int
+	stderrLines            int
+	stdoutBytes            int
+	stderrBytes            int
+	maxStdoutLineBytes     int
+	maxStderrLineBytes     int
+	displayBytes           int
+	frontendTextTruncated  int
+	frontendRawTruncated   int
+	suppressedStdoutEvents int
+	suppressedStdoutBytes  int
+	eventsEmitted          int
+	parserWarnings         int
+	nextDiagnosticByteMark int
 }
 
 // NewRunner creates a new Runner.
@@ -68,6 +149,86 @@ func (r *Runner) Stop(ctx context.Context, runID string) error {
 		delete(r.runs, id)
 	}
 	return nil
+}
+
+func appendRunDiagnostic(projectPath, runID, message string) {
+	var ms goruntime.MemStats
+	goruntime.ReadMemStats(&ms)
+	line := fmt.Sprintf(
+		"diagnostic: %s mem_alloc=%s heap_inuse=%s heap_sys=%s gc=%d goroutines=%d",
+		message,
+		formatBytes(ms.Alloc),
+		formatBytes(ms.HeapInuse),
+		formatBytes(ms.HeapSys),
+		ms.NumGC,
+		goruntime.NumGoroutine(),
+	)
+	_ = logstore.AppendProjectLogLine(projectPath, runID, line)
+}
+
+func createRunStreamLog(projectPath, runID string) (*os.File, string, error) {
+	if strings.TrimSpace(projectPath) == "" {
+		return nil, "", nil
+	}
+	dir := filepath.Join(projectPath, ".claude-tools", "runs")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, "", fmt.Errorf("无法创建 raw 流日志目录 %s: %w", dir, err)
+	}
+	path := filepath.Join(dir, safeLogFilename(runID)+".stream.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, "", fmt.Errorf("无法创建 raw 流日志 %s: %w", path, err)
+	}
+	return f, path, nil
+}
+
+func writeStreamLog(f *os.File, prefix, line string) {
+	if f == nil {
+		return
+	}
+	if prefix != "" {
+		_, _ = f.WriteString(prefix)
+	}
+	_, _ = f.WriteString(line)
+	_, _ = f.WriteString("\n")
+}
+
+func rawStreamText(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return "完整 raw 流日志: " + path + "\n"
+}
+
+func safeLogFilename(value string) string {
+	if value == "" {
+		return "run"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('_')
+	}
+	if b.Len() == 0 {
+		return "run"
+	}
+	return b.String()
+}
+
+func formatBytes(value uint64) string {
+	const kb = 1024
+	const mb = kb * 1024
+	if value >= mb {
+		return fmt.Sprintf("%.1fMiB", float64(value)/mb)
+	}
+	if value >= kb {
+		return fmt.Sprintf("%.1fKiB", float64(value)/kb)
+	}
+	return fmt.Sprintf("%dB", value)
 }
 
 func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
@@ -171,11 +332,13 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 	}
 
 	if err := logstore.AppendProjectLogLine(req.ProjectPath, runID, fmt.Sprintf(
-		"start: thread=%s session=%s model=%s permission=%s prompt=%q",
+		"start: thread=%s session=%s model=%s permission=%s prompt_bytes=%d full_prompt_bytes=%d prompt=%q",
 		req.ThreadID,
 		req.ClaudeSessionID,
 		req.Model,
 		req.PermissionMode,
+		len(req.Prompt),
+		len(fullPrompt),
 		truncateForLog(req.Prompt, 120),
 	)); err != nil {
 		runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
@@ -185,6 +348,29 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 			ThreadID: req.ThreadID,
 		})
 	}
+
+	streamLog, streamLogPath, err := createRunStreamLog(req.ProjectPath, runID)
+	if err != nil {
+		_ = logstore.AppendProjectLogLine(req.ProjectPath, runID, "raw stream log failed: "+err.Error())
+		runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
+			Type:     "stderr",
+			Text:     "创建 raw 流日志失败: " + err.Error(),
+			RunID:    runID,
+			ThreadID: req.ThreadID,
+		})
+	} else if streamLogPath != "" {
+		_ = logstore.AppendProjectLogLine(req.ProjectPath, runID, "raw stream log: "+streamLogPath)
+	}
+	if streamLog != nil {
+		defer streamLog.Close()
+	}
+	var streamLogMu sync.Mutex
+	writeRawLine := func(prefix, line string) {
+		streamLogMu.Lock()
+		defer streamLogMu.Unlock()
+		writeStreamLog(streamLog, prefix, line)
+	}
+	appendRunDiagnostic(req.ProjectPath, runID, "phase=before_start")
 
 	if err := cmd.Start(); err != nil {
 		_ = logstore.AppendProjectLogLine(req.ProjectPath, runID, "start failed: "+err.Error())
@@ -196,20 +382,26 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		})
 		return
 	}
+	appendRunDiagnostic(req.ProjectPath, runID, fmt.Sprintf("phase=started pid=%d raw_stream=%q", cmd.Process.Pid, streamLogPath))
 
-	// Collect output for logging
-	var displayParts []string
-	var rawParts []string
+	// Keep bounded previews in memory; the complete raw stream is written to disk above.
+	displayPreview := newCappedTextBuffer(maxDisplayChars, truncatedLogNote)
+	rawPreview := newCappedTextBuffer(maxRawChars, truncatedLogNote)
+	counters := runCounters{nextDiagnosticByteMark: diagnosticByteInterval}
 	var outputMu sync.Mutex
 
 	// Emit start event
 	runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 		Type:            "status",
 		Text:            runStartText(req, startTime),
+		Raw:             rawStreamText(streamLogPath),
 		RunID:           runID,
 		ThreadID:        req.ThreadID,
 		ClaudeSessionID: req.ClaudeSessionID,
 		Timestamp:       startTime.Format(time.RFC3339),
+		Meta: map[string]interface{}{
+			"raw_stream": streamLogPath,
+		},
 	})
 
 	var wg sync.WaitGroup
@@ -224,26 +416,82 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
+			writeRawLine("", line)
+			rawTruncatedNow := false
+			rawSeenAtTruncate := 0
+			progressMessage := ""
 			outputMu.Lock()
-			rawParts = append(rawParts, line)
+			counters.stdoutLines++
+			counters.stdoutBytes += len(line) + 1
+			if len(line) > counters.maxStdoutLineBytes {
+				counters.maxStdoutLineBytes = len(line)
+			}
+			rawTruncatedNow = rawPreview.Append(line + "\n")
+			if rawTruncatedNow {
+				rawSeenAtTruncate = rawPreview.SeenBytes()
+			}
+			totalBytes := counters.stdoutBytes + counters.stderrBytes
+			if totalBytes >= counters.nextDiagnosticByteMark {
+				progressMessage = fmt.Sprintf(
+					"phase=stream_progress total_stream=%s stdout_lines=%d stderr_lines=%d max_stdout_line=%s max_stderr_line=%s raw_preview=%s/%s display_preview=%s/%s",
+					formatBytes(uint64(totalBytes)),
+					counters.stdoutLines,
+					counters.stderrLines,
+					formatBytes(uint64(counters.maxStdoutLineBytes)),
+					formatBytes(uint64(counters.maxStderrLineBytes)),
+					formatBytes(uint64(rawPreview.KeptBytes())),
+					formatBytes(uint64(rawPreview.SeenBytes())),
+					formatBytes(uint64(displayPreview.KeptBytes())),
+					formatBytes(uint64(displayPreview.SeenBytes())),
+				)
+				for totalBytes >= counters.nextDiagnosticByteMark {
+					counters.nextDiagnosticByteMark += diagnosticByteInterval
+				}
+			}
 			outputMu.Unlock()
+			if rawTruncatedNow {
+				appendRunDiagnostic(req.ProjectPath, runID, fmt.Sprintf("phase=raw_preview_truncated limit=%s seen=%s stream_log=%q", formatBytes(uint64(maxRawChars)), formatBytes(uint64(rawSeenAtTruncate)), streamLogPath))
+			}
+			if progressMessage != "" {
+				appendRunDiagnostic(req.ProjectPath, runID, progressMessage)
+			}
 
 			// Extract user-visible text or compact status from stream-json.
 			eventType, display := parser.extract(line)
 			meta := parser.meta()
+			for _, warning := range parser.drainWarnings() {
+				outputMu.Lock()
+				counters.parserWarnings++
+				outputMu.Unlock()
+				appendRunDiagnostic(req.ProjectPath, runID, "phase=parser_warning "+warning)
+			}
 			now := time.Now().Format(time.RFC3339Nano)
 
 			if display != "" {
 				if eventType == "display" {
+					displayTruncatedNow := false
+					displaySeenAtTruncate := 0
 					outputMu.Lock()
-					displayParts = append(displayParts, display)
+					counters.displayBytes += len(display)
+					displayTruncatedNow = displayPreview.Append(display)
+					if displayTruncatedNow {
+						displaySeenAtTruncate = displayPreview.SeenBytes()
+					}
 					outputMu.Unlock()
+					if displayTruncatedNow {
+						appendRunDiagnostic(req.ProjectPath, runID, fmt.Sprintf("phase=display_preview_truncated limit=%s seen=%s", formatBytes(uint64(maxDisplayChars)), formatBytes(uint64(displaySeenAtTruncate))))
+					}
 				}
 				frontendDisplay := truncateFrontendPayload(display, maxFrontendEventTextChars)
+				outputMu.Lock()
+				if len(frontendDisplay) < len(display) {
+					counters.frontendTextTruncated++
+				}
+				counters.eventsEmitted++
+				outputMu.Unlock()
 				runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 					Type:            eventType,
 					Text:            frontendDisplay,
-					Raw:             truncateFrontendPayload(line, maxFrontendEventRawChars),
 					RunID:           runID,
 					ThreadID:        req.ThreadID,
 					ClaudeSessionID: parser.sessionID,
@@ -251,16 +499,20 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 					Meta:            meta,
 				})
 			} else {
-				runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
-					Type:            "stdout",
-					Text:            truncateFrontendPayload(line, maxFrontendEventTextChars),
-					Raw:             truncateFrontendPayload(line, maxFrontendEventRawChars),
-					RunID:           runID,
-					ThreadID:        req.ThreadID,
-					ClaudeSessionID: parser.sessionID,
-					Timestamp:       now,
-				})
+				outputMu.Lock()
+				counters.suppressedStdoutEvents++
+				counters.suppressedStdoutBytes += len(line) + 1
+				outputMu.Unlock()
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			appendRunDiagnostic(req.ProjectPath, runID, "phase=stdout_scanner_error error="+err.Error())
+			runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
+				Type:     "stderr",
+				Text:     "读取 stdout 失败: " + err.Error() + "\n",
+				RunID:    runID,
+				ThreadID: req.ThreadID,
+			})
 		}
 	}()
 
@@ -271,22 +523,79 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
+			writeRawLine("[STDERR] ", line)
+			rawTruncatedNow := false
+			rawSeenAtTruncate := 0
+			progressMessage := ""
 			outputMu.Lock()
-			rawParts = append(rawParts, "[STDERR] "+line)
+			counters.stderrLines++
+			counters.stderrBytes += len(line) + len("[STDERR] ") + 1
+			if len(line) > counters.maxStderrLineBytes {
+				counters.maxStderrLineBytes = len(line)
+			}
+			rawTruncatedNow = rawPreview.Append("[STDERR] " + line + "\n")
+			if rawTruncatedNow {
+				rawSeenAtTruncate = rawPreview.SeenBytes()
+			}
+			totalBytes := counters.stdoutBytes + counters.stderrBytes
+			if totalBytes >= counters.nextDiagnosticByteMark {
+				progressMessage = fmt.Sprintf(
+					"phase=stream_progress total_stream=%s stdout_lines=%d stderr_lines=%d max_stdout_line=%s max_stderr_line=%s raw_preview=%s/%s display_preview=%s/%s",
+					formatBytes(uint64(totalBytes)),
+					counters.stdoutLines,
+					counters.stderrLines,
+					formatBytes(uint64(counters.maxStdoutLineBytes)),
+					formatBytes(uint64(counters.maxStderrLineBytes)),
+					formatBytes(uint64(rawPreview.KeptBytes())),
+					formatBytes(uint64(rawPreview.SeenBytes())),
+					formatBytes(uint64(displayPreview.KeptBytes())),
+					formatBytes(uint64(displayPreview.SeenBytes())),
+				)
+				for totalBytes >= counters.nextDiagnosticByteMark {
+					counters.nextDiagnosticByteMark += diagnosticByteInterval
+				}
+			}
+			outputMu.Unlock()
+			if rawTruncatedNow {
+				appendRunDiagnostic(req.ProjectPath, runID, fmt.Sprintf("phase=raw_preview_truncated limit=%s seen=%s stream_log=%q", formatBytes(uint64(maxRawChars)), formatBytes(uint64(rawSeenAtTruncate)), streamLogPath))
+			}
+			if progressMessage != "" {
+				appendRunDiagnostic(req.ProjectPath, runID, progressMessage)
+			}
+			frontendText := truncateFrontendPayload(line, maxFrontendEventTextChars)
+			frontendRaw := truncateFrontendPayload(line, maxFrontendEventRawChars)
+			outputMu.Lock()
+			if len(frontendText) < len(line) {
+				counters.frontendTextTruncated++
+			}
+			if len(frontendRaw) < len(line) {
+				counters.frontendRawTruncated++
+			}
+			counters.eventsEmitted++
 			outputMu.Unlock()
 			runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 				Type:            "stderr",
-				Text:            truncateFrontendPayload(line, maxFrontendEventTextChars),
-				Raw:             truncateFrontendPayload(line, maxFrontendEventRawChars),
+				Text:            frontendText,
+				Raw:             frontendRaw,
 				RunID:           runID,
 				ThreadID:        req.ThreadID,
 				ClaudeSessionID: parser.sessionID,
 				Timestamp:       time.Now().Format(time.RFC3339Nano),
 			})
 		}
+		if err := scanner.Err(); err != nil {
+			appendRunDiagnostic(req.ProjectPath, runID, "phase=stderr_scanner_error error="+err.Error())
+			runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
+				Type:     "stderr",
+				Text:     "读取 stderr 失败: " + err.Error() + "\n",
+				RunID:    runID,
+				ThreadID: req.ThreadID,
+			})
+		}
 	}()
 
 	wg.Wait()
+	appendRunDiagnostic(req.ProjectPath, runID, "phase=pipes_drained")
 
 	err = cmd.Wait()
 	exitCode := 0
@@ -300,8 +609,15 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 
 	durationMS := time.Since(startTime).Milliseconds()
 	outputMu.Lock()
-	displayOutput := strings.Join(displayParts, "")
-	rawOutput := strings.Join(rawParts, "\n")
+	displayOutput := displayPreview.String()
+	rawOutput := rawStreamText(streamLogPath) + rawPreview.String()
+	finalCounters := counters
+	rawKeptBytes := rawPreview.KeptBytes()
+	rawSeenBytes := rawPreview.SeenBytes()
+	rawTruncated := rawPreview.Truncated()
+	displayKeptBytes := displayPreview.KeptBytes()
+	displaySeenBytes := displayPreview.SeenBytes()
+	displayTruncated := displayPreview.Truncated()
 	outputMu.Unlock()
 	claudeSessionID := parser.sessionID
 	if claudeSessionID == "" {
@@ -310,6 +626,28 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 
 	// Collect token usage from parser.
 	inputTokens, outputTokens := parser.usage()
+	appendRunDiagnostic(req.ProjectPath, runID, fmt.Sprintf(
+		"phase=before_persist exit_code=%d duration_ms=%d stdout_lines=%d stderr_lines=%d stdout_bytes=%s stderr_bytes=%s raw_preview=%s/%s raw_truncated=%t display_preview=%s/%s display_truncated=%t frontend_text_truncated=%d frontend_raw_truncated=%d parser_warnings=%d stream_events=%d suppressed_stdout_events=%d suppressed_stdout_bytes=%s stream_log=%q",
+		exitCode,
+		durationMS,
+		finalCounters.stdoutLines,
+		finalCounters.stderrLines,
+		formatBytes(uint64(finalCounters.stdoutBytes)),
+		formatBytes(uint64(finalCounters.stderrBytes)),
+		formatBytes(uint64(rawKeptBytes)),
+		formatBytes(uint64(rawSeenBytes)),
+		rawTruncated,
+		formatBytes(uint64(displayKeptBytes)),
+		formatBytes(uint64(displaySeenBytes)),
+		displayTruncated,
+		finalCounters.frontendTextTruncated,
+		finalCounters.frontendRawTruncated,
+		finalCounters.parserWarnings,
+		finalCounters.eventsEmitted,
+		finalCounters.suppressedStdoutEvents,
+		formatBytes(uint64(finalCounters.suppressedStdoutBytes)),
+		streamLogPath,
+	))
 
 	// Save log BEFORE emitting done so loadRecentLogs() sees it immediately.
 	log := RunLog{
@@ -353,6 +691,7 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 			ClaudeSessionID: claudeSessionID,
 		})
 	}
+	appendRunDiagnostic(req.ProjectPath, runID, "phase=after_persist")
 
 	// Emit done event
 	doneText := fmt.Sprintf("耗时 %s", formatDuration(durationMS))
@@ -374,25 +713,30 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 			"model":          req.Model,
 			"permissionMode": req.PermissionMode,
 			"created_at":     log.CreatedAt,
+			"raw_stream":     streamLogPath,
 		},
 	})
+	appendRunDiagnostic(req.ProjectPath, runID, "phase=done_event_emitted")
 }
 
 type streamParser struct {
 	tools           map[int]*toolTrace
 	thinking        map[int]bool
-	thinkingText    map[int]strings.Builder
+	thinkingText    map[int]*cappedTextBuffer
 	lastMessageText string
+	lastMessageSeen int
+	lastMessageCut  bool
 	sessionID       string
 	lastMeta        map[string]interface{}
 	inputTokens     int
 	outputTokens    int
 	usageByMessage  map[string]tokenUsage
+	warnings        []string
 }
 
 type toolTrace struct {
 	name  string
-	input strings.Builder
+	input *cappedTextBuffer
 }
 
 type tokenUsage struct {
@@ -404,9 +748,79 @@ func newStreamParser() *streamParser {
 	return &streamParser{
 		tools:          map[int]*toolTrace{},
 		thinking:       map[int]bool{},
-		thinkingText:   map[int]strings.Builder{},
+		thinkingText:   map[int]*cappedTextBuffer{},
 		usageByMessage: map[string]tokenUsage{},
 	}
+}
+
+func (p *streamParser) warn(format string, args ...interface{}) {
+	p.warnings = append(p.warnings, fmt.Sprintf(format, args...))
+}
+
+func (p *streamParser) drainWarnings() []string {
+	if len(p.warnings) == 0 {
+		return nil
+	}
+	warnings := p.warnings
+	p.warnings = nil
+	return warnings
+}
+
+func (p *streamParser) resetLastMessage() {
+	p.lastMessageText = ""
+	p.lastMessageSeen = 0
+	p.lastMessageCut = false
+}
+
+func (p *streamParser) appendLastMessage(text string) {
+	p.lastMessageSeen += len(text)
+	if p.lastMessageCut {
+		return
+	}
+	if len(p.lastMessageText)+len(text) <= maxParserStateChars {
+		p.lastMessageText += text
+		return
+	}
+	keep := maxParserStateChars - len(p.lastMessageText)
+	if keep > 0 {
+		p.lastMessageText += text[:keep]
+	}
+	p.lastMessageCut = true
+	p.warn("assistant message state exceeded %s; keeping prefix only", formatBytes(uint64(maxParserStateChars)))
+}
+
+func (p *streamParser) diffAssistantText(text string) (string, bool) {
+	if text == "" {
+		return "", true
+	}
+	if !p.lastMessageCut {
+		if text == p.lastMessageText {
+			return "", true
+		}
+		if strings.HasPrefix(text, p.lastMessageText) {
+			suffix := text[len(p.lastMessageText):]
+			p.appendLastMessage(suffix)
+			return suffix, suffix == ""
+		}
+		p.lastMessageText = ""
+		p.lastMessageSeen = 0
+		p.lastMessageCut = false
+		p.appendLastMessage(text)
+		return text, false
+	}
+	if strings.HasPrefix(text, p.lastMessageText) {
+		if len(text) <= p.lastMessageSeen {
+			p.warn("suppressed duplicate final assistant payload bytes=%s after parser state truncation", formatBytes(uint64(len(text))))
+			return "", true
+		}
+		suffix := text[p.lastMessageSeen:]
+		p.appendLastMessage(suffix)
+		return suffix, suffix == ""
+	}
+	p.warn("assistant final payload did not match truncated stream prefix; emitting capped frontend payload bytes=%s", formatBytes(uint64(len(text))))
+	p.resetLastMessage()
+	p.appendLastMessage(text)
+	return text, false
 }
 
 func (p *streamParser) usage() (int, int) {
@@ -416,6 +830,12 @@ func (p *streamParser) usage() (int, int) {
 		for _, usage := range p.usageByMessage {
 			inputTokens += usage.input
 			outputTokens += usage.output
+		}
+		if p.inputTokens > inputTokens {
+			inputTokens = p.inputTokens
+		}
+		if p.outputTokens > outputTokens {
+			outputTokens = p.outputTokens
 		}
 		return inputTokens, outputTokens
 	}
@@ -464,6 +884,23 @@ func (p *streamParser) extract(line string) (string, string) {
 		return "display", line + "\n"
 	}
 
+	if len(line) > maxParserJSONLineChars {
+		if sessionID := extractSimpleJSONStringField(line, "session_id"); sessionID != "" {
+			p.sessionID = sessionID
+		}
+		if strings.Contains(line, `"tool_result"`) {
+			p.warn("skipped oversized tool_result JSON line bytes=%s", formatBytes(uint64(len(line))))
+			p.lastMeta = map[string]interface{}{
+				"isToolResult": true,
+				"truncated":    true,
+				"bytes":        len(line),
+			}
+			return "tool-result", "[工具结果过长，已跳过解析；完整原始行已写入 raw 流日志]\n"
+		}
+		p.warn("skipped oversized JSON line bytes=%s", formatBytes(uint64(len(line))))
+		return "", ""
+	}
+
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
 		return "display", line + "\n"
@@ -482,7 +919,7 @@ func (p *streamParser) extract(line string) (string, string) {
 
 	eventType, _ := obj["type"].(string)
 	if eventType == "message_start" {
-		p.lastMessageText = ""
+		p.resetLastMessage()
 	}
 	idx := blockIndex(obj)
 
@@ -491,14 +928,16 @@ func (p *streamParser) extract(line string) (string, string) {
 		deltaType, _ := delta["type"].(string)
 
 		if text, ok := delta["text"].(string); ok && text != "" {
-			p.lastMessageText += text
+			p.appendLastMessage(text)
 			return "display", text
 		}
 
 		if deltaType == "thinking_delta" {
 			if thinking, ok := delta["thinking"].(string); ok && thinking != "" {
 				if tb, exists := p.thinkingText[idx]; exists {
-					tb.WriteString(thinking)
+					if tb.Append(thinking) {
+						p.warn("thinking meta exceeded %s for block=%d", formatBytes(uint64(maxParserMetaChars)), idx)
+					}
 				}
 				return "thinking-delta", thinking
 			}
@@ -507,7 +946,9 @@ func (p *streamParser) extract(line string) (string, string) {
 		if deltaType == "input_json_delta" {
 			if partial, ok := delta["partial_json"].(string); ok && partial != "" {
 				if tool := p.tools[idx]; tool != nil {
-					tool.input.WriteString(partial)
+					if tool.input.Append(partial) {
+						p.warn("tool input meta exceeded %s for tool=%s block=%d", formatBytes(uint64(maxParserMetaChars)), tool.name, idx)
+					}
 				}
 			}
 			return "", ""
@@ -520,10 +961,12 @@ func (p *streamParser) extract(line string) (string, string) {
 			cbType, _ := cb["type"].(string)
 			if cbType == "tool_use" {
 				name, _ := cb["name"].(string)
-				tool := &toolTrace{name: name}
+				tool := &toolTrace{name: name, input: newCappedTextBuffer(maxParserMetaChars, parserTruncatedNote)}
 				if input, ok := cb["input"].(map[string]interface{}); ok {
 					if b, err := json.Marshal(input); err == nil {
-						tool.input.Write(b)
+						if tool.input.Append(string(b)) {
+							p.warn("initial tool input meta exceeded %s for tool=%s block=%d", formatBytes(uint64(maxParserMetaChars)), name, idx)
+						}
 					}
 				}
 				p.tools[idx] = tool
@@ -532,7 +975,7 @@ func (p *streamParser) extract(line string) (string, string) {
 			}
 			if cbType == "thinking" || cbType == "redacted_thinking" {
 				p.thinking[idx] = true
-				p.thinkingText[idx] = strings.Builder{}
+				p.thinkingText[idx] = newCappedTextBuffer(maxParserMetaChars, parserTruncatedNote)
 				p.lastMeta = map[string]interface{}{"phase": "start"}
 				return "thinking-start", "深度思考中…\n"
 			}
@@ -542,26 +985,32 @@ func (p *streamParser) extract(line string) (string, string) {
 	if eventType == "content_block_stop" {
 		if tool := p.tools[idx]; tool != nil {
 			delete(p.tools, idx)
+			input := tool.input.String()
 			p.lastMeta = map[string]interface{}{
-				"phase": "end",
-				"name":  tool.name,
-				"input": tool.input.String(),
+				"phase":           "end",
+				"name":            tool.name,
+				"input":           input,
+				"input_bytes":     tool.input.SeenBytes(),
+				"input_truncated": tool.input.Truncated(),
 			}
-			if status := describeToolUse(tool.name, tool.input.String()); status != "" {
+			if status := describeToolUse(tool.name, input); status != "" {
 				return "tool-end", status
 			}
 			return "", ""
 		}
 		if p.thinking[idx] {
 			delete(p.thinking, idx)
-			thinkingContent := ""
+			thinkingBytes := 0
+			thinkingTruncated := false
 			if tb, exists := p.thinkingText[idx]; exists {
-				thinkingContent = tb.String()
+				thinkingBytes = tb.SeenBytes()
+				thinkingTruncated = tb.Truncated()
 				delete(p.thinkingText, idx)
 			}
 			p.lastMeta = map[string]interface{}{
-				"phase":   "end",
-				"content": thinkingContent,
+				"phase":             "end",
+				"content_bytes":     thinkingBytes,
+				"content_truncated": thinkingTruncated,
 			}
 			return "thinking-end", "深度思考结束\n"
 		}
@@ -609,25 +1058,19 @@ func (p *streamParser) extract(line string) (string, string) {
 			}
 			if len(parts) > 0 {
 				text := strings.Join(parts, "")
-				if text == p.lastMessageText {
-					return "", ""
-				}
-				if strings.HasPrefix(text, p.lastMessageText) {
-					suffix := strings.TrimPrefix(text, p.lastMessageText)
-					p.lastMessageText = text
+				if suffix, duplicate := p.diffAssistantText(text); !duplicate {
 					return "display", suffix
 				}
-				p.lastMessageText = text
-				return "display", text
+				return "", ""
 			}
 		}
 	}
 
 	if result, ok := obj["result"].(string); ok && result != "" {
-		if result == p.lastMessageText {
-			return "", ""
+		if suffix, duplicate := p.diffAssistantText(result); !duplicate {
+			return "display", suffix
 		}
-		return "display", result
+		return "", ""
 	}
 
 	if eventType == "error" || eventType == "aborted" {
@@ -803,4 +1246,24 @@ func truncateForLog(value string, limit int) string {
 		return string(runes)
 	}
 	return string(runes[:limit]) + "..."
+}
+
+func extractSimpleJSONStringField(line, key string) string {
+	prefix := `"` + key + `":"`
+	idx := strings.Index(line, prefix)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(prefix)
+	end := start
+	for end < len(line) {
+		if line[end] == '"' && line[end-1] != '\\' {
+			break
+		}
+		end++
+	}
+	if end <= start || end >= len(line) {
+		return ""
+	}
+	return line[start:end]
 }

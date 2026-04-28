@@ -125,14 +125,14 @@ function mergeDoneStats(lines: OutputLine[], event: OutputLine): OutputLine[] {
   return [...next, { ...event, type: 'status', text: `${stats}\n` }];
 }
 
-const MAX_RAW_LINES = 900;
-const MAX_RAW_CHARS = 700_000;
+const MAX_RAW_LINES = 160;
+const MAX_RAW_CHARS = 120_000;
 const MAX_OUTPUT_SEGMENTS = 1200;
 const MAX_DISPLAY_CHARS = 500_000;
 const MAX_THINKING_CHARS = 80_000;
 const MAX_TOOL_RESULT_CHARS = 120_000;
 const SCROLL_BOTTOM_THRESHOLD = 120;
-const TRUNCATED_NOTE = '\n\n[内容过长，界面已截断；完整内容可在 Raw 日志中查看]\n';
+const TRUNCATED_NOTE = '\n\n[内容过长，界面已截断；完整 raw 流请查看项目 .claude-tools/runs]\n';
 
 function appendLimitedText(current: string, addition: string, limit: number): string {
   if (!addition) return current;
@@ -189,7 +189,7 @@ function appendRawLine(lines: string[], line: string): string[] {
     start -= 1;
   }
   if (start <= 0) return next;
-  return [`[Raw 输出过长，已隐藏前 ${start} 行；完整内容已写入本地日志]`, ...next.slice(start)];
+  return [`[Raw 输出过长，已隐藏前 ${start} 行；完整 raw 流请查看项目 .claude-tools/runs]`, ...next.slice(start)];
 }
 
 const MODELS = [

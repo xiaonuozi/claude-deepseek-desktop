@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	maxFrontendDisplayChars = 500000
-	maxFrontendRawChars     = 700000
-	truncatedPayloadNote    = "\n\n[内容过长，界面仅显示截断预览；完整内容保存在本地日志数据库]\n"
+	maxFrontendDisplayChars  = 500000
+	maxFrontendRawChars      = 700000
+	maxTokenBackfillRawChars = 8_000_000
+	truncatedPayloadNote     = "\n\n[内容过长，界面仅显示截断预览；完整 raw 流请查看项目 .claude-tools/runs]\n"
 )
 
 var (
@@ -259,11 +260,36 @@ func (ls *LogStore) GetThread(threadID string) ([]LogEntry, error) {
 	if ls == nil || ls.db == nil {
 		return nil, fmt.Errorf("日志库未初始化")
 	}
+	displayKeep := maxFrontendDisplayChars - len(truncatedPayloadNote)
+	if displayKeep < 0 {
+		displayKeep = 0
+	}
+	rawKeep := maxFrontendRawChars - len(truncatedPayloadNote)
+	if rawKeep < 0 {
+		rawKeep = 0
+	}
 	rows, err := ls.db.Query(`
-SELECT id, thread_id, claude_session_id, created_at, project_path, model, permission_mode, prompt, display_output, raw_output, exit_code, duration_ms, input_tokens, output_tokens
+SELECT id, thread_id, claude_session_id, created_at, project_path, model, permission_mode, prompt,
+	CASE
+		WHEN length(display_output) > ? THEN substr(display_output, 1, ?) || ?
+		ELSE display_output
+	END,
+	CASE
+		WHEN length(raw_output) > ? THEN ? || substr(raw_output, length(raw_output) - ? + 1)
+		ELSE raw_output
+	END,
+	exit_code, duration_ms, input_tokens, output_tokens
 FROM runs
 WHERE COALESCE(NULLIF(thread_id, ''), id) = ?
-ORDER BY created_at ASC`, threadID)
+ORDER BY created_at ASC`,
+		maxFrontendDisplayChars,
+		displayKeep,
+		truncatedPayloadNote,
+		maxFrontendRawChars,
+		truncatedPayloadNote,
+		rawKeep,
+		threadID,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("读取线程日志失败: %w", err)
 	}
@@ -658,7 +684,7 @@ func pruneJSONLThread(path, threadID string) error {
 }
 
 func backfillTokenUsage(db *sql.DB) error {
-	rows, err := db.Query(`SELECT id, raw_output FROM runs WHERE input_tokens = 0 AND output_tokens = 0 AND raw_output <> ''`)
+	rows, err := db.Query(`SELECT id, raw_output FROM runs WHERE input_tokens = 0 AND output_tokens = 0 AND raw_output <> '' AND length(raw_output) <= ?`, maxTokenBackfillRawChars)
 	if err != nil {
 		return fmt.Errorf("读取 token 回填数据失败: %w", err)
 	}
