@@ -1,0 +1,10 @@
+.claude/
+**/.claude-tools/
+**/node_modules/
+**/dist/
+**/build/bin/
+**/*.exe
+**/*.dll
+**/*.log
+*.tmp
+*.cache
