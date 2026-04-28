@@ -15,13 +15,14 @@ type RunRequest struct {
 
 // RunEvent is emitted to the frontend in real time via Wails EventsEmit.
 type RunEvent struct {
-	Type            string `json:"type"` // "stdout", "stderr", "display", "status", "done", "error"
-	Text            string `json:"text"`
-	Raw             string `json:"raw,omitempty"`
-	RunID           string `json:"run_id"`
-	ThreadID        string `json:"thread_id"`
-	ClaudeSessionID string `json:"claude_session_id,omitempty"`
-	Timestamp       string `json:"timestamp"`
+	Type            string                 `json:"type"`
+	Text            string                 `json:"text"`
+	Raw             string                 `json:"raw,omitempty"`
+	RunID           string                 `json:"run_id"`
+	ThreadID        string                 `json:"thread_id"`
+	ClaudeSessionID string                 `json:"claude_session_id,omitempty"`
+	Timestamp       string                 `json:"timestamp"`
+	Meta            map[string]interface{} `json:"meta,omitempty"`
 }
 
 // RunLog is persisted to SQLite after each completed run.

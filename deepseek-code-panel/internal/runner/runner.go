@@ -17,56 +17,49 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// Runner manages a single claude CLI process.
+// Runner manages concurrent claude CLI processes.
 type Runner struct {
-	mu      sync.Mutex
-	running bool
-	runID   string
-	cancel  context.CancelFunc
+	mu   sync.Mutex
+	runs map[string]context.CancelFunc // runID → cancel
 }
 
 // NewRunner creates a new Runner.
 func NewRunner() *Runner {
-	return &Runner{}
+	return &Runner{runs: map[string]context.CancelFunc{}}
 }
 
-// IsRunning returns whether a run is currently in progress.
+// IsRunning returns whether any run is currently in progress.
 func (r *Runner) IsRunning() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.running
+	return len(r.runs) > 0
 }
 
 // Start launches the claude CLI with the given request and streams output via Wails events.
-// ctx must be the Wails app context (from a.startup).
+// Multiple runs can execute concurrently.
 func (r *Runner) Start(ctx context.Context, req RunRequest, runID string) {
-	r.mu.Lock()
-	if r.running {
-		r.mu.Unlock()
-		runtime.EventsEmit(ctx, "run-event", RunEvent{
-			Type:     "error",
-			Text:     "已有任务正在运行",
-			RunID:    runID,
-			ThreadID: req.ThreadID,
-		})
-		return
-	}
-	r.running = true
-	r.runID = runID
-	r.mu.Unlock()
-
 	go r.run(ctx, req, runID)
 }
 
-// Stop terminates the currently running claude process.
-func (r *Runner) Stop(ctx context.Context) error {
+// Stop terminates a specific run, or all runs if runID is empty.
+func (r *Runner) Stop(ctx context.Context, runID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.running {
+	if runID != "" {
+		if cancel, ok := r.runs[runID]; ok {
+			cancel()
+			delete(r.runs, runID)
+			return nil
+		}
+		return fmt.Errorf("未找到运行中的任务: %s", runID)
+	}
+	// Stop all
+	if len(r.runs) == 0 {
 		return fmt.Errorf("没有正在运行的任务")
 	}
-	if r.cancel != nil {
-		r.cancel()
+	for id, cancel := range r.runs {
+		cancel()
+		delete(r.runs, id)
 	}
 	return nil
 }
@@ -84,8 +77,7 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 			})
 		}
 		r.mu.Lock()
-		r.running = false
-		r.cancel = nil
+		delete(r.runs, runID)
 		r.mu.Unlock()
 	}()
 
@@ -116,7 +108,7 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 	// Create cancellable context for the claude subprocess
 	cmdCtx, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()
-	r.cancel = cancel
+	r.runs[runID] = cancel
 	r.mu.Unlock()
 	defer cancel()
 
@@ -231,6 +223,7 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 
 			// Extract user-visible text or compact status from stream-json.
 			eventType, display := parser.extract(line)
+			meta := parser.meta()
 			now := time.Now().Format(time.RFC3339Nano)
 
 			if display != "" {
@@ -247,9 +240,9 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 					ThreadID:        req.ThreadID,
 					ClaudeSessionID: parser.sessionID,
 					Timestamp:       now,
+					Meta:            meta,
 				})
 			} else {
-				// Emit as raw only (for raw output view)
 				runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 					Type:            "stdout",
 					Text:            line,
@@ -307,16 +300,7 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		claudeSessionID = req.ClaudeSessionID
 	}
 
-	// Emit done event
-	runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
-		Type:            "done",
-		Text:            fmt.Sprintf("\n<<< 运行结束，exit_code=%d, 耗时 %d ms\n", exitCode, durationMS),
-		RunID:           runID,
-		ThreadID:        req.ThreadID,
-		ClaudeSessionID: claudeSessionID,
-	})
-
-	// Save log (API key is NOT included)
+	// Save log BEFORE emitting done so loadRecentLogs() sees it immediately.
 	log := RunLog{
 		ID:              runID,
 		ThreadID:        req.ThreadID,
@@ -325,12 +309,15 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		ProjectPath:     req.ProjectPath,
 		Model:           req.Model,
 		PermissionMode:  req.PermissionMode,
-		Prompt:          req.Prompt, // Only original prompt, not language prefix
+		Prompt:          req.Prompt,
 		DisplayOutput:   displayOutput,
 		RawOutput:       rawOutput,
 		ExitCode:        exitCode,
 		DurationMS:      durationMS,
 	}
+
+	// Collect token usage from parser
+	inputTokens, outputTokens := parser.usage()
 
 	if err := logstore.AppendLog(logstore.LogEntry{
 		ID:              log.ID,
@@ -354,13 +341,30 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 			ClaudeSessionID: claudeSessionID,
 		})
 	}
+
+	// Emit done event
+	doneText := fmt.Sprintf("运行结束 · exit=%d · 耗时 %s", exitCode, formatDuration(durationMS))
+	if inputTokens > 0 || outputTokens > 0 {
+		doneText += fmt.Sprintf(" · 输入 %d token · 输出 %d token", inputTokens, outputTokens)
+	}
+	runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
+		Type:            "done",
+		Text:            doneText + "\n",
+		RunID:           runID,
+		ThreadID:        req.ThreadID,
+		ClaudeSessionID: claudeSessionID,
+	})
 }
 
 type streamParser struct {
 	tools           map[int]*toolTrace
 	thinking        map[int]bool
+	thinkingText    map[int]strings.Builder
 	lastMessageText string
 	sessionID       string
+	lastMeta        map[string]interface{}
+	inputTokens     int
+	outputTokens    int
 }
 
 type toolTrace struct {
@@ -370,19 +374,42 @@ type toolTrace struct {
 
 func newStreamParser() *streamParser {
 	return &streamParser{
-		tools:    map[int]*toolTrace{},
-		thinking: map[int]bool{},
+		tools:        map[int]*toolTrace{},
+		thinking:     map[int]bool{},
+		thinkingText: map[int]strings.Builder{},
 	}
 }
 
-// extract turns Claude stream-json into either markdown display text or compact status text.
+func (p *streamParser) usage() (int, int) {
+	return p.inputTokens, p.outputTokens
+}
+
+func formatDuration(ms int64) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	s := ms / 1000
+	if s < 60 {
+		return fmt.Sprintf("%ds", s)
+	}
+	m := s / 60
+	s = s % 60
+	return fmt.Sprintf("%dm%ds", m, s)
+}
+
+// meta returns the structured metadata for the most recent extract call.
+func (p *streamParser) meta() map[string]interface{} {
+	m := p.lastMeta
+	p.lastMeta = nil
+	return m
+}
+
+// extract turns Claude stream-json into an event type and display text.
 func (p *streamParser) extract(line string) (string, string) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return "", ""
 	}
-
-	// Quick check: if not JSON, return as-is.
 	if !strings.HasPrefix(line, "{") {
 		return "display", line + "\n"
 	}
@@ -398,18 +425,33 @@ func (p *streamParser) extract(line string) (string, string) {
 	}
 	idx := blockIndex(obj)
 
-	// 1. content_block_delta: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+	// Handle deltas
 	if delta, ok := obj["delta"].(map[string]interface{}); ok {
+		deltaType, _ := delta["type"].(string)
+
 		if text, ok := delta["text"].(string); ok && text != "" {
 			p.lastMessageText += text
 			return "display", text
 		}
-		if partial, ok := delta["partial_json"].(string); ok && partial != "" {
-			if tool := p.tools[idx]; tool != nil {
-				tool.input.WriteString(partial)
+
+		if deltaType == "thinking_delta" {
+			if thinking, ok := delta["thinking"].(string); ok && thinking != "" {
+				if tb, exists := p.thinkingText[idx]; exists {
+					tb.WriteString(thinking)
+				}
+				return "thinking-delta", thinking
+			}
+		}
+
+		if deltaType == "input_json_delta" {
+			if partial, ok := delta["partial_json"].(string); ok && partial != "" {
+				if tool := p.tools[idx]; tool != nil {
+					tool.input.WriteString(partial)
+				}
 			}
 			return "", ""
 		}
+		return "", ""
 	}
 
 	if eventType == "content_block_start" {
@@ -424,11 +466,14 @@ func (p *streamParser) extract(line string) (string, string) {
 					}
 				}
 				p.tools[idx] = tool
-				return "", ""
+				p.lastMeta = map[string]interface{}{"phase": "start", "name": name}
+				return "tool-start", describeToolStart(name)
 			}
 			if cbType == "thinking" || cbType == "redacted_thinking" {
 				p.thinking[idx] = true
-				return "status", "正在深度思考...\n"
+				p.thinkingText[idx] = strings.Builder{}
+				p.lastMeta = map[string]interface{}{"phase": "start"}
+				return "thinking-start", "深度思考中…\n"
 			}
 		}
 	}
@@ -436,20 +481,63 @@ func (p *streamParser) extract(line string) (string, string) {
 	if eventType == "content_block_stop" {
 		if tool := p.tools[idx]; tool != nil {
 			delete(p.tools, idx)
+			p.lastMeta = map[string]interface{}{
+				"phase": "end",
+				"name":  tool.name,
+				"input": tool.input.String(),
+			}
 			if status := describeToolUse(tool.name, tool.input.String()); status != "" {
-				return "status", status
+				return "tool-end", status
 			}
 			return "", ""
 		}
 		if p.thinking[idx] {
 			delete(p.thinking, idx)
-			return "status", "深度思考即将结束。\n"
+			thinkingContent := ""
+			if tb, exists := p.thinkingText[idx]; exists {
+				thinkingContent = tb.String()
+				delete(p.thinkingText, idx)
+			}
+			p.lastMeta = map[string]interface{}{
+				"phase":   "end",
+				"content": thinkingContent,
+			}
+			return "thinking-end", "深度思考结束\n"
 		}
 	}
 
-	// 2. assistant message with content array. Tool calls are intentionally ignored here.
+	// assistant message content
 	if msg, ok := obj["message"].(map[string]interface{}); ok {
+		msgRole, _ := msg["role"].(string)
 		if contentArr, ok := msg["content"].([]interface{}); ok {
+			// Check for tool_result in user messages
+			if msgRole == "user" {
+				for _, item := range contentArr {
+					if contentItem, ok := item.(map[string]interface{}); ok {
+						itemType, _ := contentItem["type"].(string)
+						if itemType == "tool_result" {
+							resultText := ""
+							if c, ok := contentItem["content"].(string); ok {
+								resultText = c
+							} else if cc, ok := contentItem["content"].([]interface{}); ok {
+								var sb strings.Builder
+								for _, cci := range cc {
+									if ccm, ok := cci.(map[string]interface{}); ok {
+										if t, ok := ccm["text"].(string); ok {
+											sb.WriteString(t)
+										}
+									}
+								}
+								resultText = sb.String()
+							}
+							p.lastMeta = map[string]interface{}{"isToolResult": true}
+							return "tool-result", truncateForLog(resultText, 300)
+						}
+					}
+				}
+			}
+
+			// Regular text content from assistant
 			var parts []string
 			for _, item := range contentArr {
 				if contentItem, ok := item.(map[string]interface{}); ok {
@@ -472,9 +560,27 @@ func (p *streamParser) extract(line string) (string, string) {
 				return "display", text
 			}
 		}
+		// Parse usage from message
+		if msgUsage, ok := msg["usage"].(map[string]interface{}); ok {
+			if it, ok := msgUsage["input_tokens"].(float64); ok {
+				p.inputTokens = int(it)
+			}
+			if ot, ok := msgUsage["output_tokens"].(float64); ok {
+				p.outputTokens = int(ot)
+			}
+		}
 	}
 
-	// 3. direct result field
+	// Parse usage from top-level result
+	if usage, ok := obj["usage"].(map[string]interface{}); ok {
+		if it, ok := usage["input_tokens"].(float64); ok {
+			p.inputTokens = int(it)
+		}
+		if ot, ok := usage["output_tokens"].(float64); ok {
+			p.outputTokens = int(ot)
+		}
+	}
+
 	if result, ok := obj["result"].(string); ok && result != "" {
 		if result == p.lastMessageText {
 			return "", ""
@@ -482,7 +588,6 @@ func (p *streamParser) extract(line string) (string, string) {
 		return "display", result
 	}
 
-	// 4. error messages
 	if eventType == "error" || eventType == "aborted" {
 		if errMsg, ok := obj["error"].(string); ok && errMsg != "" {
 			return "error", "[Error: " + errMsg + "]\n"
@@ -490,7 +595,6 @@ func (p *streamParser) extract(line string) (string, string) {
 		return "error", "[运行被中断]\n"
 	}
 
-	// Could not extract display text
 	return "", ""
 }
 
@@ -509,6 +613,29 @@ func blockIndex(obj map[string]interface{}) int {
 		return int(v)
 	}
 	return -1
+}
+
+func describeToolStart(name string) string {
+	switch name {
+	case "Read", "NotebookRead":
+		return "正在读取文件…\n"
+	case "Write", "NotebookEdit":
+		return "正在写入文件…\n"
+	case "Edit", "MultiEdit":
+		return "正在修改文件…\n"
+	case "Grep":
+		return "正在搜索代码…\n"
+	case "Glob":
+		return "正在查找文件…\n"
+	case "Bash", "PowerShell":
+		return "正在执行命令…\n"
+	case "Task":
+		return "正在处理子任务…\n"
+	case "AskUserQuestion":
+		return "等待用户确认…\n"
+	default:
+		return fmt.Sprintf("正在执行 %s…\n", name)
+	}
 }
 
 func describeToolUse(name, inputJSON string) string {

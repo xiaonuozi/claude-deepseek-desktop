@@ -13,10 +13,14 @@ export function GetRecentLogs(arg1:number):Promise<Array<logstore.LogEntry>>;
 
 export function GetThreadLogs(arg1:string):Promise<Array<logstore.LogEntry>>;
 
+export function LoadSetting(arg1:string):Promise<string>;
+
+export function SaveSetting(arg1:string,arg2:string):Promise<void>;
+
 export function SelectProjectDirectory():Promise<string>;
 
 export function StartRun(arg1:runner.RunRequest):Promise<string>;
 
-export function StopRun():Promise<void>;
+export function StopRun(arg1:string):Promise<void>;
 
 export function WriteAppLog(arg1:string):Promise<void>;

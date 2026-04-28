@@ -902,3 +902,121 @@ textarea:disabled {
     width: auto;
   }
 }
+
+.thinking-fold {
+  margin: 8px 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #faf8f5;
+  overflow: hidden;
+}
+
+.thinking-fold summary {
+  padding: 8px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.thinking-fold summary:hover {
+  color: var(--ink);
+}
+
+.thinking-body {
+  margin: 0;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.tool-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 4px 0;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.tool-start-line {
+  background: #f5f2ed;
+  color: var(--muted);
+}
+
+.tool-end-line {
+  background: #eef7f0;
+  color: #2a6b3f;
+}
+
+.tool-badge {
+  display: inline-block;
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #e0dbd2;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.tool-badge.end {
+  background: #b8d9c2;
+  color: #1a5c2e;
+}
+
+.tool-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-result-fold {
+  margin: 4px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.tool-result-fold summary {
+  padding: 5px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tool-result-body {
+  margin: 0;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  color: var(--muted);
+}
+
+.done-line {
+  margin-top: 14px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #f0f7ff;
+  color: #2a5a9e;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: center;
+}

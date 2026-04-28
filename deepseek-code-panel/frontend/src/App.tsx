@@ -10,6 +10,8 @@ import {
   DeleteThreads,
   WriteAppLog,
   GetLogPath,
+  SaveSetting,
+  LoadSetting,
 } from '../wailsjs/go/main/App';
 import { logstore } from '../wailsjs/go/models';
 
@@ -21,6 +23,7 @@ type OutputLine = {
   thread_id?: string;
   claude_session_id?: string;
   timestamp?: string;
+  meta?: Record<string, any>;
 };
 
 type LogEntry = logstore.LogEntry;
@@ -28,6 +31,7 @@ type ViewMode = 'output' | 'raw';
 type OutputSegment = {
   type: string;
   text: string;
+  meta?: Record<string, any>;
 };
 
 class AppErrorBoundary extends Component<{ children: ReactNode }, { message: string }> {
@@ -70,6 +74,8 @@ const PERMISSION_MODES = [
 function buildOutputSegments(lines: OutputLine[]): OutputSegment[] {
   const segments: OutputSegment[] = [];
   let markdown = '';
+  let thinkingBuf = '';
+  let inThinking = false;
 
   const flushMarkdown = () => {
     if (markdown.trim()) {
@@ -78,16 +84,43 @@ function buildOutputSegments(lines: OutputLine[]): OutputSegment[] {
     markdown = '';
   };
 
+  const flushThinking = () => {
+    if (inThinking && thinkingBuf.trim()) {
+      segments.push({ type: 'thinking-block', text: thinkingBuf.trim() });
+    }
+    thinkingBuf = '';
+    inThinking = false;
+  };
+
   for (const line of lines) {
+    if (line.type === 'thinking-delta') {
+      inThinking = true;
+      thinkingBuf += line.text;
+      continue;
+    }
+    if (line.type === 'thinking-start') {
+      inThinking = true;
+      continue;
+    }
+    if (line.type === 'thinking-end') {
+      flushThinking();
+      continue;
+    }
     if (line.type === 'display') {
       markdown += line.text;
       continue;
     }
     flushMarkdown();
-    segments.push({ type: line.type, text: line.text });
+    flushThinking();
+    if (line.type === 'tool-start' || line.type === 'tool-end') {
+      segments.push({ type: line.type, text: line.text, meta: line.meta });
+    } else {
+      segments.push({ type: line.type, text: line.text });
+    }
   }
 
   flushMarkdown();
+  flushThinking();
   return segments;
 }
 
@@ -239,6 +272,7 @@ function App() {
   const [prompt, setPrompt] = useState('');
 
   const [isRunning, setIsRunning] = useState(false);
+  const [activeRunID, setActiveRunID] = useState('');
   const [outputLines, setOutputLines] = useState<OutputLine[]>([]);
   const [rawOutput, setRawOutput] = useState<string[]>([]);
   const [viewMode, setViewMode] = useState<ViewMode>('output');
@@ -251,7 +285,6 @@ function App() {
   const [recentLogs, setRecentLogs] = useState<LogEntry[]>([]);
   const [activeThreadID, setActiveThreadID] = useState('');
   const [activeSessionID, setActiveSessionID] = useState('');
-  const [isComposing, setIsComposing] = useState(false);
 
   const outputRef = useRef<HTMLDivElement>(null);
 
@@ -279,7 +312,19 @@ function App() {
     GetLogPath()
       .then((p) => setLogPath(p))
       .catch(() => {});
+    LoadSetting('api_key').then((v) => { if (v) setApiKey(v); }).catch(() => {});
+    LoadSetting('base_url').then((v) => { if (v) setBaseUrl(v); }).catch(() => {});
   }, [loadRecentLogs]);
+
+  // Persist settings on change
+  const saveApiKey = useCallback((key: string) => {
+    setApiKey(key);
+    SaveSetting('api_key', key).catch(() => {});
+  }, []);
+  const saveBaseUrl = useCallback((url: string) => {
+    setBaseUrl(url);
+    SaveSetting('base_url', url).catch(() => {});
+  }, []);
 
   useEffect(() => {
     EventsOn('run-event', (event: OutputLine) => {
@@ -291,7 +336,9 @@ function App() {
           ]);
         }
 
-      if (event.type === 'display' || event.type === 'status' || event.type === 'stderr' || event.type === 'done') {
+      if (event.type === 'display' || event.type === 'status' || event.type === 'stderr' || event.type === 'done' ||
+          event.type === 'thinking-start' || event.type === 'thinking-delta' || event.type === 'thinking-end' ||
+          event.type === 'tool-start' || event.type === 'tool-end' || event.type === 'tool-result') {
         setOutputLines((prev) => [...prev, event]);
       }
 
@@ -311,7 +358,7 @@ function App() {
         if (event.type === 'done') {
           log('INFO', 'run-event done');
           setIsRunning(false);
-          setIsComposing(false);
+  
           loadRecentLogs();
         }
       } catch (err: any) {
@@ -362,7 +409,7 @@ function App() {
         setOutputLines([]);
         setRawOutput([]);
         setPrompt('');
-        setIsComposing(false);
+
         setError('');
         setViewMode('output');
       }
@@ -379,7 +426,6 @@ function App() {
     setError('');
     setActiveThreadID('');
     setActiveSessionID('');
-    setIsComposing(false);
     setViewMode('output');
   };
 
@@ -400,7 +446,6 @@ function App() {
     setActiveThreadID(createLocalID('new'));
     setActiveSessionID('');
     setPrompt('');
-    setIsComposing(false);
     setViewMode('output');
   };
 
@@ -418,7 +463,6 @@ function App() {
       setOutputLines([]);
       setRawOutput([]);
       setPrompt('');
-      setIsComposing(false);
       setError('');
       setViewMode('output');
     } catch (err: any) {
@@ -454,14 +498,14 @@ function App() {
     if (!projectPath) { setError('请先选择项目目录'); return; }
     if (!apiKey.trim()) { setError('请输入 DeepSeek API Key'); setShowSettings(true); return; }
     if (!trimmedPrompt) { setError('请输入任务内容'); return; }
-    if (isRunning) { setError('已有任务正在运行'); return; }
-
     const threadID = (activeThreadID && !activeThreadID.startsWith('new-')) ? activeThreadID : createLocalID('thread');
     const runID = createLocalID('run');
 
+    setActiveRunID(runID);
+    setActiveThreadID(threadID);
+
     log('INFO', `doStartRun: thread=${threadID} run=${runID} project=${projectPath} model=${effectiveModel} mode=${mode}`);
 
-    setActiveThreadID(threadID);
     setOutputLines((prev) => [
       ...prev,
       { type: 'user', text: trimmedPrompt, run_id: runID, thread_id: threadID },
@@ -472,7 +516,6 @@ function App() {
     setViewMode('output');
     setIsRunning(true);
     setPrompt('');
-    setIsComposing(false);
 
     try {
       await StartRun({
@@ -497,7 +540,8 @@ function App() {
 
   const handleStop = async () => {
     try {
-      await StopRun();
+      await StopRun(activeRunID);
+      setIsRunning(false);
     } catch (err: any) {
       setError('停止失败: ' + err);
     }
@@ -654,17 +698,58 @@ function App() {
                   <span>{formatTime(new Date().toISOString())}</span>
                 </div>
                 <div className="response-stream">
-                  {outputSegments.map((segment, index) => (
-                    segment.type === 'display' ? (
-                      <MarkdownMessage key={`md-${index}`} text={segment.text} />
-                    ) : segment.type === 'user' ? (
-                      <div key={`user-${index}`} className="user-message">{segment.text}</div>
-                    ) : (
+                  {outputSegments.map((segment, index) => {
+                    if (segment.type === 'display') {
+                      return <MarkdownMessage key={`md-${index}`} text={segment.text} />;
+                    }
+                    if (segment.type === 'user') {
+                      return <div key={`user-${index}`} className="user-message">{segment.text}</div>;
+                    }
+                    if (segment.type === 'thinking-block') {
+                      return (
+                        <details key={`think-${index}`} className="thinking-fold">
+                          <summary>深度思考内容</summary>
+                          <pre className="thinking-body">{segment.text}</pre>
+                        </details>
+                      );
+                    }
+                    if (segment.type === 'tool-start') {
+                      const toolName = segment.meta?.name || '';
+                      return (
+                        <div key={`tool-${index}`} className="output-line tool-line tool-start-line">
+                          <span className="tool-badge">{toolName}</span>
+                          <span className="tool-text">{segment.text}</span>
+                        </div>
+                      );
+                    }
+                    if (segment.type === 'tool-end') {
+                      const toolName = segment.meta?.name || '';
+                      return (
+                        <div key={`tool-${index}`} className="output-line tool-line tool-end-line">
+                          <span className="tool-badge end">{toolName}</span>
+                          <span className="tool-text">{segment.text}</span>
+                        </div>
+                      );
+                    }
+                    if (segment.type === 'tool-result') {
+                      return (
+                        <details key={`tr-${index}`} className="tool-result-fold">
+                          <summary>查看结果</summary>
+                          <pre className="tool-result-body">{segment.text}</pre>
+                        </details>
+                      );
+                    }
+                    if (segment.type === 'done') {
+                      return (
+                        <div key={`done-${index}`} className="output-line done-line">{segment.text}</div>
+                      );
+                    }
+                    return (
                       <pre key={`line-${index}`} className={`output-line ${segment.type}`}>
                         {segment.text}
                       </pre>
-                    )
-                  ))}
+                    );
+                  })}
                 </div>
               </article>
             )}
@@ -675,15 +760,7 @@ function App() {
           <div className="composer-card">
             <textarea
               value={prompt}
-              onChange={(event) => {
-                if (!isComposing) setPrompt(event.target.value);
-              }}
-              onCompositionStart={() => setIsComposing(true)}
-              onCompositionEnd={(event) => {
-                setIsComposing(false);
-                setPrompt((event.target as HTMLTextAreaElement).value);
-              }}
-              onBlur={() => setIsComposing(false)}
+              onChange={(event) => setPrompt(event.target.value)}
               placeholder="要求后续变更"
               disabled={isRunning}
             />
@@ -726,7 +803,7 @@ function App() {
               <input
                 type="password"
                 value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
+                onChange={(event) => saveApiKey(event.target.value)}
                 placeholder="sk-..."
                 disabled={isRunning}
               />
@@ -737,7 +814,7 @@ function App() {
               <input
                 type="text"
                 value={baseUrl}
-                onChange={(event) => setBaseUrl(event.target.value)}
+                onChange={(event) => saveBaseUrl(event.target.value)}
                 disabled={isRunning}
               />
             </label>

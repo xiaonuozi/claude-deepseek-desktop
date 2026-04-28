@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_project_path ON runs(project_path);
+CREATE TABLE IF NOT EXISTS settings (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL DEFAULT ''
+);
 `
 
 // Init initializes the global log store singleton. Safe to call multiple times.
@@ -309,15 +313,36 @@ func (ls *LogStore) GetLogDir() string {
 }
 
 // DeleteThreads removes all runs belonging to the given thread.
-func (ls *LogStore) DeleteThreads(threadID string) error {
+func (ls *LogStore) DeleteThreads(threadID string) (int64, error) {
+	if ls == nil || ls.db == nil {
+		return 0, fmt.Errorf("日志库未初始化")
+	}
+	result, err := ls.db.Exec(`DELETE FROM runs WHERE COALESCE(NULLIF(thread_id, ''), id) = ?`, threadID)
+	if err != nil {
+		return 0, fmt.Errorf("删除线程日志失败: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
+}
+
+func (ls *LogStore) SetSetting(key, value string) error {
 	if ls == nil || ls.db == nil {
 		return fmt.Errorf("日志库未初始化")
 	}
-	_, err := ls.db.Exec(`DELETE FROM runs WHERE COALESCE(NULLIF(thread_id, ''), id) = ?`, threadID)
-	if err != nil {
-		return fmt.Errorf("删除线程日志失败: %w", err)
+	_, err := ls.db.Exec(`INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+func (ls *LogStore) GetSetting(key string) (string, error) {
+	if ls == nil || ls.db == nil {
+		return "", fmt.Errorf("日志库未初始化")
 	}
-	return nil
+	var value string
+	err := ls.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
 }
 
 func insertEntry(db *sql.DB, entry LogEntry) error {
@@ -378,12 +403,30 @@ func GetLatestSessionID(threadID string) (string, error) {
 }
 
 // DeleteThreads removes all runs belonging to the given thread from the global store.
-func DeleteThreads(threadID string) error {
+func DeleteThreads(threadID string) (int64, error) {
+	store, err := globalStore()
+	if err != nil {
+		return 0, err
+	}
+	return store.DeleteThreads(threadID)
+}
+
+// SetSetting persists a key-value setting.
+func SetSetting(key, value string) error {
 	store, err := globalStore()
 	if err != nil {
 		return err
 	}
-	return store.DeleteThreads(threadID)
+	return store.SetSetting(key, value)
+}
+
+// GetSetting retrieves a setting value.
+func GetSetting(key string) (string, error) {
+	store, err := globalStore()
+	if err != nil {
+		return "", err
+	}
+	return store.GetSetting(key)
 }
 
 func appendProjectArtifacts(entry LogEntry) error {

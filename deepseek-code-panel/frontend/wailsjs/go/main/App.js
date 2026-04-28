@@ -22,6 +22,14 @@ export function GetThreadLogs(arg1) {
   return window['go']['main']['App']['GetThreadLogs'](arg1);
 }
 
+export function LoadSetting(arg1) {
+  return window['go']['main']['App']['LoadSetting'](arg1);
+}
+
+export function SaveSetting(arg1, arg2) {
+  return window['go']['main']['App']['SaveSetting'](arg1, arg2);
+}
+
 export function SelectProjectDirectory() {
   return window['go']['main']['App']['SelectProjectDirectory']();
 }
@@ -30,8 +38,8 @@ export function StartRun(arg1) {
   return window['go']['main']['App']['StartRun'](arg1);
 }
 
-export function StopRun() {
-  return window['go']['main']['App']['StopRun']();
+export function StopRun(arg1) {
+  return window['go']['main']['App']['StopRun'](arg1);
 }
 
 export function WriteAppLog(arg1) {

@@ -135,10 +135,6 @@ func (a *App) StartRun(req runner.RunRequest) (string, error) {
 		req.Language = "中文"
 	}
 
-	if a.runner.IsRunning() {
-		return "", fmt.Errorf("已有任务正在运行")
-	}
-
 	runID := uuid.New().String()
 	if req.ThreadID == "" {
 		req.ThreadID = runID
@@ -147,9 +143,9 @@ func (a *App) StartRun(req runner.RunRequest) (string, error) {
 	return runID, nil
 }
 
-// StopRun stops the currently running claude process.
-func (a *App) StopRun() error {
-	return a.runner.Stop(a.ctx)
+// StopRun stops a specific run or all runs if runID is empty.
+func (a *App) StopRun(runID string) error {
+	return a.runner.Stop(a.ctx, runID)
 }
 
 // GetRecentLogs returns the most recent run logs from the JSONL file.
@@ -175,5 +171,20 @@ func (a *App) DeleteThreads(threadID string) error {
 	if threadID == "" {
 		return fmt.Errorf("线程 ID 不能为空")
 	}
-	return logstore.DeleteThreads(threadID)
+	n, err := logstore.DeleteThreads(threadID)
+	if err != nil {
+		return err
+	}
+	_ = a.WriteAppLog(fmt.Sprintf("DeleteThreads: thread=%s deleted=%d rows", threadID, n))
+	return nil
+}
+
+// SaveSetting persists a key-value setting.
+func (a *App) SaveSetting(key, value string) error {
+	return logstore.SetSetting(key, value)
+}
+
+// LoadSetting retrieves a setting value.
+func (a *App) LoadSetting(key string) (string, error) {
+	return logstore.GetSetting(key)
 }
