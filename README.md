@@ -1,4 +1,4 @@
-# DeepSeek Code Panel
+# Claude Code DeepSeek GUI - DeepSeek Code Panel
 
 ## Who is this for?
 
