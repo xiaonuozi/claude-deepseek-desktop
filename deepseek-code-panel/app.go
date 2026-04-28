@@ -103,6 +103,7 @@ func (a *App) GetLogPath() (string, error) {
 
 // StartRun validates the request and starts a claude run.
 func (a *App) StartRun(req runner.RunRequest) (string, error) {
+	req.RunID = strings.TrimSpace(req.RunID)
 	req.ProjectPath = strings.TrimSpace(req.ProjectPath)
 	req.ThreadID = strings.TrimSpace(req.ThreadID)
 	req.ClaudeSessionID = strings.TrimSpace(req.ClaudeSessionID)
@@ -136,7 +137,10 @@ func (a *App) StartRun(req runner.RunRequest) (string, error) {
 		req.Language = "中文"
 	}
 
-	runID := uuid.New().String()
+	runID := req.RunID
+	if runID == "" {
+		runID = uuid.New().String()
+	}
 	if req.ThreadID == "" {
 		req.ThreadID = runID
 	}

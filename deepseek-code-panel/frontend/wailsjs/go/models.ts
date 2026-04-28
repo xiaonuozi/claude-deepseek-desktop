@@ -44,6 +44,7 @@ export namespace logstore {
 export namespace runner {
 	
 	export class RunRequest {
+	    run_id: string;
 	    project_path: string;
 	    thread_id: string;
 	    claude_session_id: string;
@@ -60,6 +61,7 @@ export namespace runner {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.run_id = source["run_id"];
 	        this.project_path = source["project_path"];
 	        this.thread_id = source["thread_id"];
 	        this.claude_session_id = source["claude_session_id"];

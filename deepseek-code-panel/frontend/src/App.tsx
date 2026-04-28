@@ -1,4 +1,4 @@
-import { Component, ReactNode, useState, useEffect, useRef, useCallback } from 'react';
+import { Component, ReactNode, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { EventsOn, EventsOff, LogPrint } from '../wailsjs/runtime/runtime';
 import {
   CheckClaudeInstalled,
@@ -32,6 +32,12 @@ type OutputSegment = {
   type: string;
   text: string;
   meta?: Record<string, any>;
+};
+type ThreadBuffers = {
+  outputLines: OutputLine[];
+  rawOutput: string[];
+  error: string;
+  sessionID: string;
 };
 
 class AppErrorBoundary extends Component<{ children: ReactNode }, { message: string }> {
@@ -117,6 +123,73 @@ function mergeDoneStats(lines: OutputLine[], event: OutputLine): OutputLine[] {
   });
   if (updated) return next;
   return [...next, { ...event, type: 'status', text: `${stats}\n` }];
+}
+
+const MAX_RAW_LINES = 900;
+const MAX_RAW_CHARS = 700_000;
+const MAX_OUTPUT_SEGMENTS = 1200;
+const MAX_DISPLAY_CHARS = 500_000;
+const MAX_THINKING_CHARS = 80_000;
+const MAX_TOOL_RESULT_CHARS = 120_000;
+const SCROLL_BOTTOM_THRESHOLD = 120;
+const TRUNCATED_NOTE = '\n\n[内容过长，界面已截断；完整内容可在 Raw 日志中查看]\n';
+
+function appendLimitedText(current: string, addition: string, limit: number): string {
+  if (!addition) return current;
+  if (current.includes(TRUNCATED_NOTE) || current.length >= limit) return current;
+  const next = current + addition;
+  if (next.length <= limit) return next;
+  return next.slice(0, Math.max(0, limit - TRUNCATED_NOTE.length)) + TRUNCATED_NOTE;
+}
+
+function limitEventText(event: OutputLine): OutputLine {
+  if (event.type === 'tool-result' && event.text.length > MAX_TOOL_RESULT_CHARS) {
+    return { ...event, text: event.text.slice(0, MAX_TOOL_RESULT_CHARS - TRUNCATED_NOTE.length) + TRUNCATED_NOTE };
+  }
+  if (event.type === 'thinking-delta' && event.text.length > MAX_THINKING_CHARS) {
+    return { ...event, text: event.text.slice(0, MAX_THINKING_CHARS - TRUNCATED_NOTE.length) + TRUNCATED_NOTE };
+  }
+  if (event.type === 'display' && event.text.length > MAX_DISPLAY_CHARS) {
+    return { ...event, text: event.text.slice(0, MAX_DISPLAY_CHARS - TRUNCATED_NOTE.length) + TRUNCATED_NOTE };
+  }
+  return event;
+}
+
+function shouldMergeOutputLine(prev: OutputLine | undefined, next: OutputLine): boolean {
+  if (!prev) return false;
+  if (prev.run_id !== next.run_id || prev.thread_id !== next.thread_id || prev.type !== next.type) return false;
+  return next.type === 'display' || next.type === 'thinking-delta' || next.type === 'stderr';
+}
+
+function appendOutputLine(lines: OutputLine[], event: OutputLine): OutputLine[] {
+  const limitedEvent = limitEventText(event);
+  const prev = lines[lines.length - 1];
+  let nextLines: OutputLine[];
+  if (shouldMergeOutputLine(prev, limitedEvent)) {
+    const limit = limitedEvent.type === 'thinking-delta' ? MAX_THINKING_CHARS : MAX_DISPLAY_CHARS;
+    nextLines = [
+      ...lines.slice(0, -1),
+      { ...prev!, text: appendLimitedText(prev!.text, limitedEvent.text, limit) },
+    ];
+  } else {
+    nextLines = [...lines, limitedEvent];
+  }
+  if (nextLines.length <= MAX_OUTPUT_SEGMENTS) return nextLines;
+  return nextLines.slice(nextLines.length - MAX_OUTPUT_SEGMENTS);
+}
+
+function appendRawLine(lines: string[], line: string): string[] {
+  const next = [...lines, line];
+  let start = next.length;
+  let chars = 0;
+  while (start > 0 && next.length - start < MAX_RAW_LINES) {
+    const candidate = next[start - 1] || '';
+    if (chars + candidate.length > MAX_RAW_CHARS) break;
+    chars += candidate.length;
+    start -= 1;
+  }
+  if (start <= 0) return next;
+  return [`[Raw 输出过长，已隐藏前 ${start} 行；完整内容已写入本地日志]`, ...next.slice(start)];
 }
 
 const MODELS = [
@@ -332,8 +405,6 @@ function App() {
   const [language, setLanguage] = useState('中文');
   const [prompt, setPrompt] = useState('');
 
-  const [isRunning, setIsRunning] = useState(false);
-  const [activeRunID, setActiveRunID] = useState('');
   const [outputLines, setOutputLines] = useState<OutputLine[]>([]);
   const [rawOutput, setRawOutput] = useState<string[]>([]);
   const [viewMode, setViewMode] = useState<ViewMode>('output');
@@ -343,17 +414,116 @@ function App() {
   const [logPath, setLogPath] = useState('');
   const [showAllThreads, setShowAllThreads] = useState(false);
   const [showProjectThreads, setShowProjectThreads] = useState(true);
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
 
   const [recentLogs, setRecentLogs] = useState<LogEntry[]>([]);
+  const [pendingLogs, setPendingLogs] = useState<Record<string, LogEntry>>({});
+  const [runningByThread, setRunningByThread] = useState<Record<string, string>>({});
+  const [threadBuffers, setThreadBuffers] = useState<Record<string, ThreadBuffers>>({});
   const [activeThreadID, setActiveThreadID] = useState('');
   const [activeSessionID, setActiveSessionID] = useState('');
 
   const outputRef = useRef<HTMLDivElement>(null);
+  const activeThreadIDRef = useRef('');
+  const runningByThreadRef = useRef<Record<string, string>>({});
+  const threadBuffersRef = useRef<Record<string, ThreadBuffers>>({});
+  const flushTimerRef = useRef<number | null>(null);
+  const stickToBottomRef = useRef(true);
+
+  const activeThreadRunning = !!(activeThreadID && runningByThread[activeThreadID]);
+  const isRunning = Object.keys(runningByThread).length > 0;
+  const activeRunID = activeThreadID ? runningByThread[activeThreadID] || '' : '';
 
   const log = useCallback((level: string, msg: string) => {
     const line = `[${level}] ${msg}`;
     try { LogPrint(line); } catch {}
     try { WriteAppLog(line); } catch {}
+  }, []);
+
+  useEffect(() => {
+    activeThreadIDRef.current = activeThreadID;
+  }, [activeThreadID]);
+
+  useEffect(() => {
+    runningByThreadRef.current = runningByThread;
+  }, [runningByThread]);
+
+  useEffect(() => {
+    threadBuffersRef.current = threadBuffers;
+  }, [threadBuffers]);
+
+  useEffect(() => () => {
+    if (flushTimerRef.current !== null) {
+      window.clearTimeout(flushTimerRef.current);
+    }
+  }, []);
+
+  const blankThreadBuffers = useCallback((): ThreadBuffers => ({
+    outputLines: [],
+    rawOutput: [],
+    error: '',
+    sessionID: '',
+  }), []);
+
+  const flushThreadBuffers = useCallback(() => {
+    flushTimerRef.current = null;
+    setThreadBuffers(threadBuffersRef.current);
+    const activeThreadID = activeThreadIDRef.current;
+    if (!activeThreadID) return;
+    const activeBuffers = threadBuffersRef.current[activeThreadID];
+    if (!activeBuffers) return;
+    setOutputLines(activeBuffers.outputLines);
+    setRawOutput(activeBuffers.rawOutput);
+    setError(activeBuffers.error);
+    setActiveSessionID(activeBuffers.sessionID);
+  }, []);
+
+  const scheduleThreadBufferFlush = useCallback(() => {
+    if (flushTimerRef.current !== null) return;
+    flushTimerRef.current = window.setTimeout(flushThreadBuffers, 60);
+  }, [flushThreadBuffers]);
+
+  const writeThreadBuffers = useCallback((threadID: string, updater: (current: ThreadBuffers) => ThreadBuffers) => {
+    if (!threadID) return;
+    const current = threadBuffersRef.current[threadID] || blankThreadBuffers();
+    const next = updater(current);
+    threadBuffersRef.current = { ...threadBuffersRef.current, [threadID]: next };
+    scheduleThreadBufferFlush();
+  }, [blankThreadBuffers, scheduleThreadBufferFlush]);
+
+  const switchToThread = useCallback((threadID: string) => {
+    stickToBottomRef.current = true;
+    setShowScrollBottom(false);
+    activeThreadIDRef.current = threadID;
+    setActiveThreadID(threadID);
+    const buffers = threadBuffersRef.current[threadID] || blankThreadBuffers();
+    setOutputLines(buffers.outputLines);
+    setRawOutput(buffers.rawOutput);
+    setError(buffers.error);
+    setActiveSessionID(buffers.sessionID);
+    setViewMode('output');
+  }, [blankThreadBuffers]);
+
+  const isNearBottom = useCallback((element: HTMLDivElement) => (
+    element.scrollHeight - element.scrollTop - element.clientHeight <= SCROLL_BOTTOM_THRESHOLD
+  ), []);
+
+  const handleConversationScroll = useCallback(() => {
+    const element = outputRef.current;
+    if (!element) return;
+    const nearBottom = isNearBottom(element);
+    stickToBottomRef.current = nearBottom;
+    setShowScrollBottom(!nearBottom);
+  }, [isNearBottom]);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    const element = outputRef.current;
+    if (!element) return;
+    stickToBottomRef.current = true;
+    setShowScrollBottom(false);
+    window.requestAnimationFrame(() => {
+      element.scrollTo({ top: element.scrollHeight, behavior });
+    });
   }, []);
 
   const loadRecentLogs = useCallback(async () => {
@@ -391,45 +561,63 @@ function App() {
   useEffect(() => {
     EventsOn('run-event', (event: OutputLine) => {
       try {
-        if (event.raw) {
-          setRawOutput((prev) => [
-            ...prev,
-            event.type === 'stderr' ? '[STDERR] ' + event.raw : event.raw!,
-          ]);
-        }
-
-        if (event.type === 'display' || event.type === 'status' || event.type === 'stderr' ||
+        const threadID = event.thread_id || activeThreadIDRef.current;
+        if (!threadID) return;
+        const shouldAppendOutput = event.type === 'display' || event.type === 'status' || event.type === 'stderr' ||
           event.type === 'thinking-start' || event.type === 'thinking-delta' || event.type === 'thinking-end' ||
-          event.type === 'tool-start' || event.type === 'tool-end' || event.type === 'tool-result') {
-          setOutputLines((prev) => [...prev, event]);
-        }
+          event.type === 'tool-start' || event.type === 'tool-end';
 
-        if (event.type === 'done') {
-          setOutputLines((prev) => mergeDoneStats(prev, event));
-          const exitCode = toFiniteNumber(event.meta?.exit_code);
-          if (Number.isFinite(exitCode) && exitCode !== 0) {
-            setError(`运行退出码: ${exitCode}`);
-          }
-        }
-
+        const exitCode = toFiniteNumber(event.meta?.exit_code);
         if (event.type === 'error') {
           log('ERROR', 'run-event error: ' + event.text);
-          setError(event.text);
         }
-
-        if (event.thread_id) {
-          setActiveThreadID(event.thread_id);
-        }
-
-        if (event.claude_session_id) {
-          setActiveSessionID(event.claude_session_id);
-        }
-
         if (event.type === 'done') {
           log('INFO', 'run-event done');
-          setIsRunning(false);
-  
-          loadRecentLogs();
+        }
+
+        writeThreadBuffers(threadID, (current) => {
+          let next = current;
+          if (event.raw) {
+            const rawLine = event.type === 'stderr' ? '[STDERR] ' + event.raw : event.raw;
+            next = { ...next, rawOutput: appendRawLine(next.rawOutput, rawLine || '') };
+          }
+          if (shouldAppendOutput) {
+            next = { ...next, outputLines: appendOutputLine(next.outputLines, event) };
+          }
+          if (event.type === 'done') {
+            next = { ...next, outputLines: mergeDoneStats(next.outputLines, event) };
+            if (Number.isFinite(exitCode) && exitCode !== 0) {
+              next = { ...next, error: `运行退出码: ${exitCode}` };
+            }
+          }
+          if (event.type === 'error') {
+            next = { ...next, error: event.text };
+          }
+          if (event.claude_session_id) {
+            next = { ...next, sessionID: event.claude_session_id || next.sessionID };
+          }
+          return next;
+        });
+
+        if (event.type === 'done' || event.type === 'error') {
+          setRunningByThread((prev) => {
+            const next = { ...prev };
+            delete next[threadID];
+            runningByThreadRef.current = next;
+            return next;
+          });
+          const cleanupPending = () => {
+            setPendingLogs((prev) => {
+              const next = { ...prev };
+              delete next[threadID];
+              return next;
+            });
+          };
+          if (event.type === 'done') {
+            loadRecentLogs().finally(cleanupPending);
+          } else {
+            cleanupPending();
+          }
         }
       } catch (err: any) {
         log('ERROR', 'run-event handler error: ' + String(err));
@@ -439,13 +627,17 @@ function App() {
     return () => {
       EventsOff('run-event');
     };
-  }, [loadRecentLogs, log]);
+  }, [loadRecentLogs, log, writeThreadBuffers]);
 
   useEffect(() => {
     if (outputRef.current) {
-      outputRef.current.scrollTop = outputRef.current.scrollHeight;
+      if (stickToBottomRef.current) {
+        scrollToBottom('auto');
+      } else {
+        setShowScrollBottom(true);
+      }
     }
-  }, [outputLines, rawOutput, viewMode]);
+  }, [outputLines, rawOutput, viewMode, scrollToBottom]);
 
   const truncate = (value: string, size: number) => (
     value && value.length > size ? value.slice(0, size - 1) + '…' : value
@@ -455,13 +647,18 @@ function App() {
   const selectedModelLabel = MODELS.find((item) => item.value === model)?.label || effectiveModel;
   const selectedPermissionLabel = PERMISSION_MODES.find((item) => item.value === permissionMode)?.label || permissionMode;
   const projectName = projectPath ? projectPath.split(/[\\/]/).filter(Boolean).pop() || projectPath : 'Claude Tools';
+  const pendingThreadIDs = new Set(Object.keys(pendingLogs));
+  const mergedLogs = [
+    ...Object.values(pendingLogs),
+    ...recentLogs.filter((log) => !pendingThreadIDs.has(log.thread_id || log.id)),
+  ].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   const activeLog = activeThreadID
-    ? recentLogs.find((log) => (log.thread_id || log.id) === activeThreadID)
+    ? mergedLogs.find((log) => (log.thread_id || log.id) === activeThreadID)
     : null;
   const visibleLogs = projectPath
-    ? recentLogs.filter((log) => !log.project_path || log.project_path === projectPath)
-    : recentLogs;
-  const outputSegments = buildOutputSegments(outputLines);
+    ? mergedLogs.filter((log) => !log.project_path || log.project_path === projectPath)
+    : mergedLogs;
+  const outputSegments = useMemo(() => buildOutputSegments(outputLines), [outputLines]);
   const conversationTitle = activeLog
     ? truncate(activeLog.prompt || '历史运行', 26)
     : activeThreadID
@@ -478,13 +675,8 @@ function App() {
         log('INFO', 'handleSelectDir: selected ' + dir);
         setProjectPath(dir);
         setShowProjectThreads(true);
-        setActiveThreadID(createLocalID('new'));
-        setActiveSessionID('');
-        setOutputLines([]);
-        setRawOutput([]);
+        switchToThread(createLocalID('new'));
         setPrompt('');
-
-        setError('');
         setViewMode('output');
       }
     } catch (err: any) {
@@ -495,18 +687,20 @@ function App() {
   };
 
   const handleClear = () => {
-    setOutputLines([]);
-    setRawOutput([]);
-    setError('');
-    setActiveThreadID('');
-    setActiveSessionID('');
+    if (activeThreadID) {
+      writeThreadBuffers(activeThreadID, () => blankThreadBuffers());
+    } else {
+      setOutputLines([]);
+      setRawOutput([]);
+      setError('');
+      setActiveSessionID('');
+    }
     setViewMode('output');
   };
 
   const handleNewTask = () => {
-    handleClear();
     setPrompt('');
-    setActiveThreadID(createLocalID('new'));
+    switchToThread(createLocalID('new'));
   };
 
   const handleToggleProjectThreads = () => {
@@ -518,14 +712,9 @@ function App() {
       await handleSelectDir();
       return;
     }
-    setOutputLines([]);
-    setRawOutput([]);
-    setError('');
-    setActiveThreadID(createLocalID('new'));
-    setActiveSessionID('');
     setPrompt('');
     setShowProjectThreads(true);
-    setViewMode('output');
+    switchToThread(createLocalID('new'));
   };
 
   const handleNewThreadFromLog = (logEntry: LogEntry) => {
@@ -537,13 +726,8 @@ function App() {
         return;
       }
       setProjectPath(threadProjectPath);
-      setActiveThreadID(createLocalID('new'));
-      setActiveSessionID('');
-      setOutputLines([]);
-      setRawOutput([]);
       setPrompt('');
-      setError('');
-      setViewMode('output');
+      switchToThread(createLocalID('new'));
     } catch (err: any) {
       log('ERROR', 'handleNewThreadFromLog error: ' + String(err));
     }
@@ -556,7 +740,17 @@ function App() {
     try {
       await DeleteThreads(threadID);
       log('INFO', 'handleDeleteThread: deleted thread ' + threadID);
+      const nextBuffers = { ...threadBuffersRef.current };
+      delete nextBuffers[threadID];
+      threadBuffersRef.current = nextBuffers;
+      setThreadBuffers(nextBuffers);
+      setPendingLogs((prev) => {
+        const next = { ...prev };
+        delete next[threadID];
+        return next;
+      });
       if ((activeThreadID || activeSessionID) && activeThreadID === threadID) {
+        activeThreadIDRef.current = '';
         setActiveThreadID('');
         setActiveSessionID('');
         setOutputLines([]);
@@ -579,28 +773,67 @@ function App() {
     if (!trimmedPrompt) { setError('请输入任务内容'); return; }
     const threadID = (activeThreadID && !activeThreadID.startsWith('new-')) ? activeThreadID : createLocalID('thread');
     const runID = createLocalID('run');
+    const startedAt = new Date().toISOString();
+    const existingBuffers = threadBuffersRef.current[threadID] || (
+      activeThreadID === threadID
+        ? { outputLines, rawOutput, error: '', sessionID: activeSessionID }
+        : blankThreadBuffers()
+    );
+    const nextBuffers: ThreadBuffers = {
+      ...existingBuffers,
+      error: '',
+      outputLines: [
+        ...existingBuffers.outputLines,
+        { type: 'user', text: trimmedPrompt, run_id: runID, thread_id: threadID },
+      ],
+    };
 
-    setActiveRunID(runID);
+    stickToBottomRef.current = true;
+    setShowScrollBottom(false);
+    activeThreadIDRef.current = threadID;
+    threadBuffersRef.current = { ...threadBuffersRef.current, [threadID]: nextBuffers };
+    setThreadBuffers(threadBuffersRef.current);
     setActiveThreadID(threadID);
+    setActiveSessionID(nextBuffers.sessionID);
+    setOutputLines(nextBuffers.outputLines);
+    setRawOutput(nextBuffers.rawOutput);
+    setError('');
+    setRunningByThread((prev) => {
+      const next = { ...prev, [threadID]: runID };
+      runningByThreadRef.current = next;
+      return next;
+    });
+    setPendingLogs((prev) => ({
+      ...prev,
+      [threadID]: {
+        id: runID,
+        thread_id: threadID,
+        claude_session_id: nextBuffers.sessionID,
+        created_at: startedAt,
+        project_path: projectPath,
+        model: effectiveModel,
+        permission_mode: mode,
+        prompt: trimmedPrompt,
+        display_output: '',
+        raw_output: '',
+        exit_code: 0,
+        duration_ms: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+      } as LogEntry,
+    }));
 
     log('INFO', `doStartRun: thread=${threadID} run=${runID} project=${projectPath} model=${effectiveModel} mode=${mode}`);
 
-    setOutputLines((prev) => [
-      ...prev,
-      { type: 'user', text: trimmedPrompt, run_id: runID, thread_id: threadID },
-    ]);
-    if (!activeThreadID) {
-      setRawOutput([]);
-    }
     setViewMode('output');
-    setIsRunning(true);
     setPrompt('');
 
     try {
       await StartRun({
+        run_id: runID,
         project_path: projectPath,
         thread_id: threadID,
-        claude_session_id: activeSessionID,
+        claude_session_id: nextBuffers.sessionID,
         prompt: trimmedPrompt,
         api_key: apiKey.trim(),
         base_url: baseUrl.trim(),
@@ -612,15 +845,37 @@ function App() {
     } catch (err: any) {
       const msg = '启动失败: ' + err;
       log('ERROR', msg);
-      setError(msg);
-      setIsRunning(false);
+      writeThreadBuffers(threadID, (current) => ({
+        ...current,
+        error: msg,
+      }));
+      setRunningByThread((prev) => {
+        const next = { ...prev };
+        delete next[threadID];
+        runningByThreadRef.current = next;
+        return next;
+      });
+      setPendingLogs((prev) => {
+        const next = { ...prev };
+        delete next[threadID];
+        return next;
+      });
     }
   };
 
   const handleStop = async () => {
     try {
+      if (!activeRunID) {
+        setError('当前线程没有正在运行的任务');
+        return;
+      }
       await StopRun(activeRunID);
-      setIsRunning(false);
+      setRunningByThread((prev) => {
+        const next = { ...prev };
+        if (activeThreadID) delete next[activeThreadID];
+        runningByThreadRef.current = next;
+        return next;
+      });
     } catch (err: any) {
       setError('停止失败: ' + err);
     }
@@ -628,20 +883,29 @@ function App() {
 
   const handleViewLog = async (log: LogEntry) => {
     const threadID = log.thread_id || log.id;
+    const liveBuffers = threadBuffersRef.current[threadID];
+    if (liveBuffers && (liveBuffers.outputLines.length > 0 || runningByThreadRef.current[threadID])) {
+      stickToBottomRef.current = true;
+      setShowScrollBottom(false);
+      activeThreadIDRef.current = threadID;
+      setActiveThreadID(threadID);
+      setActiveSessionID(liveBuffers.sessionID || log.claude_session_id || '');
+      setProjectPath(log.project_path || projectPath);
+      setViewMode('output');
+      setOutputLines(liveBuffers.outputLines);
+      setRawOutput(liveBuffers.rawOutput);
+      setError(liveBuffers.error);
+      return;
+    }
+
     const logs = await GetThreadLogs(threadID);
     const threadLogs = logs && logs.length ? logs : [log];
     const lastLog = threadLogs[threadLogs.length - 1];
-
-    setActiveThreadID(threadID);
-    setActiveSessionID(lastLog.claude_session_id || '');
-    setProjectPath(lastLog.project_path || log.project_path);
-    setViewMode('output');
-    setRawOutput(threadLogs.flatMap((entry) => [
+    const nextRawOutput = threadLogs.flatMap((entry) => [
       `--- run ${entry.id.slice(0, 8)} / ${entry.created_at} ---`,
       ...(entry.raw_output ? entry.raw_output.split('\n') : []),
-    ]));
-    setError(lastLog.exit_code === 0 ? '' : `历史运行退出码: ${lastLog.exit_code}`);
-    setOutputLines(threadLogs.flatMap((entry) => [
+    ]);
+    const nextOutputLines = threadLogs.flatMap((entry) => [
       { type: 'user', text: entry.prompt, run_id: entry.id, thread_id: threadID },
       {
         type: 'system',
@@ -656,7 +920,27 @@ function App() {
         },
       },
       { type: 'display', text: entry.display_output || '(empty)\n', run_id: entry.id, thread_id: threadID },
-    ]));
+    ]);
+    const nextError = lastLog.exit_code === 0 ? '' : `历史运行退出码: ${lastLog.exit_code}`;
+    const nextBuffers: ThreadBuffers = {
+      outputLines: nextOutputLines,
+      rawOutput: nextRawOutput,
+      error: nextError,
+      sessionID: lastLog.claude_session_id || '',
+    };
+
+    stickToBottomRef.current = true;
+    setShowScrollBottom(false);
+    activeThreadIDRef.current = threadID;
+    threadBuffersRef.current = { ...threadBuffersRef.current, [threadID]: nextBuffers };
+    setThreadBuffers(threadBuffersRef.current);
+    setActiveThreadID(threadID);
+    setActiveSessionID(nextBuffers.sessionID);
+    setProjectPath(lastLog.project_path || log.project_path);
+    setViewMode('output');
+    setRawOutput(nextBuffers.rawOutput);
+    setError(nextBuffers.error);
+    setOutputLines(nextBuffers.outputLines);
   };
 
   const formatTime = (iso: string) => {
@@ -684,7 +968,7 @@ function App() {
     <div id="App">
       <aside className="codex-sidebar">
         <nav className="sidebar-nav">
-          <button onClick={handleNewTask} disabled={isRunning}><span>□</span>新对话</button>
+          <button onClick={handleNewTask}><span>□</span>新对话</button>
           <button><span>⌕</span>搜索</button>
           <button><span>⌘</span>插件</button>
           <button><span>◷</span>自动化</button>
@@ -694,8 +978,8 @@ function App() {
           <div className="group-heading">
             <span>项目</span>
             <div className="group-actions">
-              <button onClick={handleSelectDir} disabled={isRunning} title="选择项目目录">↗</button>
-              <button onClick={handleClear} disabled={isRunning} title="清空输出">≡</button>
+              <button onClick={handleSelectDir} title="选择项目目录">↗</button>
+              <button onClick={handleClear} disabled={activeThreadRunning} title="清空输出">≡</button>
             </div>
           </div>
 
@@ -705,7 +989,7 @@ function App() {
               <span className="folder-icon">▱</span>
               <span className="project-name">{projectName}</span>
             </button>
-            <button className="project-new-thread" onClick={handleProjectThread} disabled={isRunning} title={projectPath ? '开启新线程' : '选择项目目录'}>+</button>
+            <button className="project-new-thread" onClick={handleProjectThread} title={projectPath ? '开启新线程' : '选择项目目录'}>+</button>
           </div>
         </section>
 
@@ -714,17 +998,21 @@ function App() {
             {visibleLogs.length === 0 ? (
               <div className="empty-list">暂无聊天</div>
             ) : (
-              (showAllThreads ? visibleLogs : visibleLogs.slice(0, 5)).map((log) => (
-                <button
-                  key={log.id}
-                  className={`history-row ${(log.thread_id || log.id) === activeThreadID ? 'active' : ''}`}
-                  onClick={() => handleViewLog(log)}
-                >
-                  <span>{truncate(log.prompt || '(empty prompt)', 28)}</span>
-                  <time>{formatAge(log.created_at)}</time>
-                  <span className="delete-thread" onClick={(e) => handleDeleteThread(log, e)} title="删除线程">×</span>
-                </button>
-              ))
+              (showAllThreads ? visibleLogs : visibleLogs.slice(0, 5)).map((log) => {
+                const threadID = log.thread_id || log.id;
+                const threadRunning = !!runningByThread[threadID];
+                return (
+                  <button
+                    key={threadID}
+                    className={`history-row ${threadID === activeThreadID ? 'active' : ''}`}
+                    onClick={() => handleViewLog(log)}
+                  >
+                    <span>{truncate(log.prompt || '(empty prompt)', 28)}</span>
+                    <time>{threadRunning ? '运行中' : formatAge(log.created_at)}</time>
+                    {!threadRunning && <span className="delete-thread" onClick={(e) => handleDeleteThread(log, e)} title="删除线程">×</span>}
+                  </button>
+                );
+              })
             )}
             {visibleLogs.length > 5 && (
               <button className="expand-toggle" onClick={() => setShowAllThreads(!showAllThreads)}>
@@ -748,7 +1036,7 @@ function App() {
           </div>
 
           <div className="header-actions">
-            {isRunning ? (
+            {activeThreadRunning ? (
               <button className="pill-button danger" onClick={handleStop}>停止</button>
             ) : (
               <button className="icon-button" onClick={() => doStartRun(permissionMode)} title="运行">▷</button>
@@ -757,7 +1045,7 @@ function App() {
               <span className="chip-logo">◆</span>
               <span>{selectedModelLabel}</span>
             </button>
-            <button className="pill-button" onClick={() => doStartRun(permissionMode)} disabled={isRunning}>
+            <button className="pill-button" onClick={() => doStartRun(permissionMode)} disabled={activeThreadRunning}>
               提交⌄
             </button>
             <span className="divider" />
@@ -768,7 +1056,7 @@ function App() {
           </div>
         </header>
 
-        <div className="conversation-scroll" ref={outputRef}>
+        <div className="conversation-scroll" ref={outputRef} onScroll={handleConversationScroll}>
           <div className="conversation-lane">
             {error && <div className="error-banner">{error}{logPath ? <><br/><small>日志路径: {logPath}</small></> : ''}</div>}
 
@@ -844,29 +1132,35 @@ function App() {
           </div>
         </div>
 
+        {showScrollBottom && (
+          <button className="scroll-bottom-button" onClick={() => scrollToBottom()} title="跳到底部">
+            ↓
+          </button>
+        )}
+
         <section className="composer-dock">
           <div className="composer-card">
             <textarea
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
               placeholder="要求后续变更"
-              disabled={isRunning}
+              disabled={activeThreadRunning}
             />
 
             <div className="composer-bar">
               <div className="composer-left">
-                <button className="round-button" onClick={handleSelectDir} disabled={isRunning} title="选择项目">+</button>
-                <select value={permissionMode} onChange={(event) => setPermissionMode(event.target.value)} disabled={isRunning}>
+                <button className="round-button" onClick={handleSelectDir} title="选择项目">+</button>
+                <select value={permissionMode} onChange={(event) => setPermissionMode(event.target.value)} disabled={activeThreadRunning}>
                   {PERMISSION_MODES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                 </select>
               </div>
 
               <div className="composer-right">
-                <select value={model} onChange={(event) => { setModel(event.target.value); setCustomModel(''); }} disabled={isRunning}>
+                <select value={model} onChange={(event) => { setModel(event.target.value); setCustomModel(''); }} disabled={activeThreadRunning}>
                   {MODELS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                   <option value="__custom__">Custom model</option>
                 </select>
-                <button className="send-button" onClick={() => doStartRun(permissionMode)} disabled={isRunning} title="提交">↑</button>
+                <button className="send-button" onClick={() => doStartRun(permissionMode)} disabled={activeThreadRunning} title="提交">↑</button>
               </div>
             </div>
           </div>
@@ -893,7 +1187,7 @@ function App() {
                 value={apiKey}
                 onChange={(event) => saveApiKey(event.target.value)}
                 placeholder="sk-..."
-                disabled={isRunning}
+                disabled={activeThreadRunning}
               />
             </label>
 
@@ -903,7 +1197,7 @@ function App() {
                 type="text"
                 value={baseUrl}
                 onChange={(event) => saveBaseUrl(event.target.value)}
-                disabled={isRunning}
+                disabled={activeThreadRunning}
               />
             </label>
 
@@ -915,7 +1209,7 @@ function App() {
                   value={customModel}
                   onChange={(event) => setCustomModel(event.target.value)}
                   placeholder="deepseek-v4-pro"
-                  disabled={isRunning}
+                  disabled={activeThreadRunning}
                 />
               </label>
             )}
@@ -926,7 +1220,7 @@ function App() {
                 type="text"
                 value={language}
                 onChange={(event) => setLanguage(event.target.value)}
-                disabled={isRunning}
+                disabled={activeThreadRunning}
               />
             </label>
 

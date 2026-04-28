@@ -2,6 +2,7 @@ package runner
 
 // RunRequest is the request from frontend to start a claude run.
 type RunRequest struct {
+	RunID           string `json:"run_id"`
 	ProjectPath     string `json:"project_path"`
 	ThreadID        string `json:"thread_id"`
 	ClaudeSessionID string `json:"claude_session_id"`
