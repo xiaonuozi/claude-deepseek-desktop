@@ -1,4 +1,4 @@
-package runner
+﻿package runner
 
 import (
 	"bufio"
@@ -1199,6 +1199,10 @@ func describeToolStart(name string) string {
 		return "正在处理子任务…\n"
 	case "AskUserQuestion":
 		return "等待用户确认…\n"
+	case "ExitPlanMode", "EnterPlanMode":
+		return "正在生成计划…\n"
+	case "TodoWrite":
+		return "正在整理任务列表…\n"
 	default:
 		return fmt.Sprintf("正在执行 %s…\n", name)
 	}
@@ -1256,6 +1260,17 @@ func describeToolUse(name, inputJSON string) string {
 		return "正在处理子任务\n"
 	case "AskUserQuestion":
 		return "等待用户确认\n"
+	case "ExitPlanMode", "EnterPlanMode":
+		plan := firstString(input, "plan")
+		if plan != "" {
+			return "计划内容：\n" + truncateForLog(plan, 2000) + "\n"
+		}
+		return "正在生成计划…\n"
+	case "TodoWrite":
+		if todos, ok := input["todos"].([]interface{}); ok && len(todos) > 0 {
+			return fmt.Sprintf("任务列表（%d 项）\n", len(todos))
+		}
+		return "正在更新任务列表…\n"
 	default:
 		return ""
 	}

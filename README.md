@@ -1,6 +1,19 @@
 # DeepSeek Code Panel
 
-本地 AI 编程助手桌面应用。基于 Wails v2 + Go + React 构建，通过 `claude` CLI 连接 DeepSeek Anthropic API，提供多线程对话、流式输出、SQLite 持久化等功能。
+## Who is this for?
+
+DeepSeek Code Panel is a Windows desktop GUI for **Claude Code CLI** that connects to **DeepSeek Anthropic API**. It provides streaming output, multi-session conversations, project workspaces, SQLite history, Claude session resume, tool-call rendering, and permission modes such as plan, accept edits, auto permissions, and full access.
+This project is for developers who want to use **DeepSeek models** with **Claude Code CLI** in a desktop GUI instead of a pure terminal workflow.
+
+It is especially useful if you need:
+
+- A Windows desktop panel for Claude Code
+- DeepSeek Anthropic API integration
+- Project-based coding sessions
+- Streaming output and raw `stream-json` view
+- Multi-thread conversations
+- Resume previous Claude sessions
+- Permission modes such as plan, accept edits, auto permissions, and full access
 
 ---
 
@@ -44,25 +57,25 @@ claude --version
 
 ### 权限模式
 
-| 模式 | 说明 |
-|------|------|
+| 模式     | 说明                         |
+| -------- | ---------------------------- |
 | 默认权限 | 标准权限确认，每次操作需批准 |
-| 计划模式 | 仅执行计划，不修改文件 |
-| 接受编辑 | 自动批准编辑操作 |
-| 自动权限 | 自动批准常见操作 |
-| 完全访问 | 跳过所有权限检查 |
+| 计划模式 | 仅执行计划，不修改文件       |
+| 接受编辑 | 自动批准编辑操作             |
+| 自动权限 | 自动批准常见操作             |
+| 完全访问 | 跳过所有权限检查             |
 
 启动后的默认权限模式为 **完全访问**，可在底部下拉菜单中切换。
 
 ### 线程管理
 
-| 操作 | 效果 |
-|------|------|
-| 单击历史记录 | 切换至该线程，查看历史对话 |
-| 点击「新对话」 | 创建空白新线程 |
-| 点击项目行 | 展开或收起该项目下的线程列表 |
-| 点击项目行右侧 `+` | 在当前项目中开启新线程 |
-| hover × | 删除线程（含确认对话框） |
+| 操作               | 效果                         |
+| ------------------ | ---------------------------- |
+| 单击历史记录       | 切换至该线程，查看历史对话   |
+| 点击「新对话」     | 创建空白新线程               |
+| 点击项目行         | 展开或收起该项目下的线程列表 |
+| 点击项目行右侧 `+` | 在当前项目中开启新线程       |
+| hover ×            | 删除线程（含确认对话框）     |
 
 - 历史列表按项目筛选，只显示当前项目下的线程
 - 空白新线程不会写入历史，直到输入内容并提交运行后才会出现
@@ -102,9 +115,9 @@ claude --version
 
 以下环境变量用于开发调试或问题排查，正常使用无需设置：
 
-| 变量 | 说明 |
-|------|------|
-| `CLAUDE_TOOLS_RAW_LOG=1` | 将完整的 stream-json 原始输出写入磁盘文件（位于项目 `.claude-tools/` 目录下） |
+| 变量                         | 说明                                                                                             |
+| ---------------------------- | ------------------------------------------------------------------------------------------------ |
+| `CLAUDE_TOOLS_RAW_LOG=1`     | 将完整的 stream-json 原始输出写入磁盘文件（位于项目 `.claude-tools/` 目录下）                    |
 | `CLAUDE_TOOLS_DIAGNOSTICS=1` | 启用诊断日志（同时也会启用 Raw 日志），记录每个阶段的字节量、截断信息等，用于排查 OOM 或性能问题 |
 
 ---
@@ -170,11 +183,11 @@ internal/logstore/      — SQLite 持久化（运行记录 + 设置）、Schema
 
 ### 日志文件
 
-| 文件 | 内容 |
-|------|------|
-| `runs.db` | SQLite 数据库（运行记录 + 设置） |
-| `app.log` | 应用运行日志（含崩溃堆栈） |
-| `runs.jsonl` | 旧版 JSONL 格式（迁移后保留） |
+| 文件         | 内容                             |
+| ------------ | -------------------------------- |
+| `runs.db`    | SQLite 数据库（运行记录 + 设置） |
+| `app.log`    | 应用运行日志（含崩溃堆栈）       |
+| `runs.jsonl` | 旧版 JSONL 格式（迁移后保留）    |
 
 ### 内存管理
 

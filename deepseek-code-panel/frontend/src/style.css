@@ -764,8 +764,21 @@ button {
   font-weight: 700;
 }
 
-.send-button:hover:not(:disabled) {
+.send-button:not(:disabled):not(.running) {
   background: #2f2f2f;
+}
+
+.send-button:hover:not(:disabled):not(.running) {
+  background: #4a4a4a;
+}
+
+.send-button.running {
+  background: #d73a31;
+  color: #fff;
+}
+
+.send-button.running:hover {
+  background: #b5302a;
 }
 
 .workspace-status {
@@ -1117,9 +1130,8 @@ textarea:disabled {
 
 .tool-text {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .tool-result-fold {

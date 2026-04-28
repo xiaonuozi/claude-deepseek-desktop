@@ -272,6 +272,15 @@ function buildOutputSegments(lines: OutputLine[]): OutputSegment[] {
 
   const appendActivity = (item: ActivityItem) => {
     if (!item.text.trim() && item.type !== 'status' && item.type !== 'system') return;
+    // 对于 tool-start 的 update 事件，替换上一个同名工具条目而非重复添加
+    if (item.type === 'tool-start' && item.meta?.phase === 'update' && item.meta?.name) {
+      for (let i = activityItems.length - 1; i >= 0; i--) {
+        if (activityItems[i].type === 'tool-start' && activityItems[i].meta?.name === item.meta.name) {
+          activityItems[i] = item;
+          return;
+        }
+      }
+    }
     if (sameActivityItem(activityItems[activityItems.length - 1], item)) return;
     activityItems.push(item);
   };
@@ -718,7 +727,7 @@ function App() {
         if (!threadID) return;
         const shouldAppendOutput = event.type === 'display' || event.type === 'status' || event.type === 'stderr' ||
           event.type === 'thinking-start' || event.type === 'thinking-delta' || event.type === 'thinking-end' ||
-          event.type === 'tool-start' || event.type === 'tool-end';
+          event.type === 'tool-start' || event.type === 'tool-end' || event.type === 'tool-result';
 
         const exitCode = toFiniteNumber(event.meta?.exit_code);
         if (event.type === 'error') {
@@ -976,6 +985,9 @@ function App() {
 
     setPrompt('');
 
+    scrollToBottom('auto');
+    setTimeout(() => scrollToBottom('auto'), 100);
+
     try {
       await StartRun({
         run_id: runID,
@@ -1181,11 +1193,6 @@ function App() {
             <button className="icon-button" onClick={() => setShowSettings(true)} title="更多设置">•••</button>
           </div>
 
-          <div className="header-actions">
-            {activeThreadRunning ? (
-              <button className="pill-button danger" onClick={handleStop}>停止</button>
-            ) : null}
-          </div>
         </header>
 
         <div className="conversation-scroll" ref={outputRef} onScroll={handleConversationScroll}>
@@ -1276,6 +1283,14 @@ function App() {
             <textarea
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.ctrlKey && !event.shiftKey) {
+                  event.preventDefault();
+                  if (!activeThreadRunning) {
+                    doStartRun(permissionMode);
+                  }
+                }
+              }}
               placeholder="要求后续变更"
               disabled={activeThreadRunning}
             />
@@ -1293,7 +1308,20 @@ function App() {
                   {MODELS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                   <option value="__custom__">Custom model</option>
                 </select>
-                <button className="send-button" onClick={() => doStartRun(permissionMode)} disabled={activeThreadRunning} title="提交">↑</button>
+                <button
+                  className={`send-button${activeThreadRunning ? ' running' : ''}`}
+                  onClick={() => {
+                    if (activeThreadRunning) {
+                      handleStop();
+                    } else {
+                      doStartRun(permissionMode);
+                    }
+                  }}
+                  disabled={!activeThreadRunning && !prompt.trim()}
+                  title={activeThreadRunning ? '停止' : '提交'}
+                >
+                  {activeThreadRunning ? '■' : '↑'}
+                </button>
               </div>
             </div>
           </div>
