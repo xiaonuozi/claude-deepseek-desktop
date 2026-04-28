@@ -39,4 +39,6 @@ type RunLog struct {
 	RawOutput       string `json:"raw_output"`
 	ExitCode        int    `json:"exit_code"`
 	DurationMS      int64  `json:"duration_ms"`
+	InputTokens     int    `json:"input_tokens"`
+	OutputTokens    int    `json:"output_tokens"`
 }

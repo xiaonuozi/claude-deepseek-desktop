@@ -13,6 +13,8 @@ export namespace logstore {
 	    raw_output: string;
 	    exit_code: number;
 	    duration_ms: number;
+	    input_tokens: number;
+	    output_tokens: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new LogEntry(source);
@@ -32,6 +34,8 @@ export namespace logstore {
 	        this.raw_output = source["raw_output"];
 	        this.exit_code = source["exit_code"];
 	        this.duration_ms = source["duration_ms"];
+	        this.input_tokens = source["input_tokens"];
+	        this.output_tokens = source["output_tokens"];
 	    }
 	}
 

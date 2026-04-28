@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS runs (
 	display_output TEXT NOT NULL,
 	raw_output TEXT NOT NULL,
 	exit_code INTEGER NOT NULL,
-	duration_ms INTEGER NOT NULL
+	duration_ms INTEGER NOT NULL,
+	input_tokens INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_project_path ON runs(project_path);
@@ -137,6 +139,8 @@ type LogEntry struct {
 	RawOutput       string `json:"raw_output"`
 	ExitCode        int    `json:"exit_code"`
 	DurationMS      int64  `json:"duration_ms"`
+	InputTokens     int    `json:"input_tokens"`
+	OutputTokens    int    `json:"output_tokens"`
 }
 
 // LogStore provides read/write access to a SQLite run log.
@@ -196,7 +200,7 @@ func (ls *LogStore) GetRecent(limit int) ([]LogEntry, error) {
 		limit = 20
 	}
 	rows, err := ls.db.Query(`
-SELECT r.id, r.thread_id, r.claude_session_id, r.created_at, r.project_path, r.model, r.permission_mode, r.prompt, r.display_output, r.raw_output, r.exit_code, r.duration_ms
+SELECT r.id, r.thread_id, r.claude_session_id, r.created_at, r.project_path, r.model, r.permission_mode, r.prompt, r.display_output, r.raw_output, r.exit_code, r.duration_ms, r.input_tokens, r.output_tokens
 FROM runs r
 JOIN (
 	SELECT COALESCE(NULLIF(thread_id, ''), id) AS thread_key, MAX(created_at) AS latest_created_at
@@ -227,6 +231,8 @@ LIMIT ?`, limit)
 			&entry.RawOutput,
 			&entry.ExitCode,
 			&entry.DurationMS,
+			&entry.InputTokens,
+			&entry.OutputTokens,
 		); err != nil {
 			return nil, fmt.Errorf("解析 SQLite 日志失败: %w", err)
 		}
@@ -247,7 +253,7 @@ func (ls *LogStore) GetThread(threadID string) ([]LogEntry, error) {
 		return nil, fmt.Errorf("日志库未初始化")
 	}
 	rows, err := ls.db.Query(`
-SELECT id, thread_id, claude_session_id, created_at, project_path, model, permission_mode, prompt, display_output, raw_output, exit_code, duration_ms
+SELECT id, thread_id, claude_session_id, created_at, project_path, model, permission_mode, prompt, display_output, raw_output, exit_code, duration_ms, input_tokens, output_tokens
 FROM runs
 WHERE COALESCE(NULLIF(thread_id, ''), id) = ?
 ORDER BY created_at ASC`, threadID)
@@ -272,6 +278,8 @@ ORDER BY created_at ASC`, threadID)
 			&entry.RawOutput,
 			&entry.ExitCode,
 			&entry.DurationMS,
+			&entry.InputTokens,
+			&entry.OutputTokens,
 		); err != nil {
 			return nil, fmt.Errorf("解析线程日志失败: %w", err)
 		}
@@ -322,6 +330,9 @@ func (ls *LogStore) DeleteThreads(threadID string) (int64, error) {
 		return 0, fmt.Errorf("删除线程日志失败: %w", err)
 	}
 	n, _ := result.RowsAffected()
+	if err := pruneJSONLThread(filepath.Join(ls.dir, "runs.jsonl"), threadID); err != nil {
+		return n, err
+	}
 	return n, nil
 }
 
@@ -351,8 +362,8 @@ func insertEntry(db *sql.DB, entry LogEntry) error {
 	}
 	_, err := db.Exec(`
 INSERT INTO runs (
-	id, thread_id, claude_session_id, created_at, project_path, model, permission_mode, prompt, display_output, raw_output, exit_code, duration_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	id, thread_id, claude_session_id, created_at, project_path, model, permission_mode, prompt, display_output, raw_output, exit_code, duration_ms, input_tokens, output_tokens
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	thread_id = excluded.thread_id,
 	claude_session_id = excluded.claude_session_id,
@@ -364,7 +375,9 @@ ON CONFLICT(id) DO UPDATE SET
 	display_output = excluded.display_output,
 	raw_output = excluded.raw_output,
 	exit_code = excluded.exit_code,
-	duration_ms = excluded.duration_ms`,
+	duration_ms = excluded.duration_ms,
+	input_tokens = excluded.input_tokens,
+	output_tokens = excluded.output_tokens`,
 		entry.ID,
 		entry.ThreadID,
 		entry.ClaudeSessionID,
@@ -377,6 +390,8 @@ ON CONFLICT(id) DO UPDATE SET
 		entry.RawOutput,
 		entry.ExitCode,
 		entry.DurationMS,
+		entry.InputTokens,
+		entry.OutputTokens,
 	)
 	if err != nil {
 		return fmt.Errorf("写入 SQLite 日志失败: %w", err)
@@ -471,11 +486,24 @@ func migrateColumns(db *sql.DB) error {
 			return fmt.Errorf("迁移 SQLite 日志 claude_session_id 失败: %w", err)
 		}
 	}
+	if !columns["input_tokens"] {
+		if _, err := db.Exec(`ALTER TABLE runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("迁移 SQLite 日志 input_tokens 失败: %w", err)
+		}
+	}
+	if !columns["output_tokens"] {
+		if _, err := db.Exec(`ALTER TABLE runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("迁移 SQLite 日志 output_tokens 失败: %w", err)
+		}
+	}
 	if _, err := db.Exec(`UPDATE runs SET thread_id = id WHERE thread_id = ''`); err != nil {
 		return fmt.Errorf("修复 SQLite 线程 id 失败: %w", err)
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_runs_thread_id ON runs(thread_id)`); err != nil {
 		return fmt.Errorf("创建 SQLite 线程索引失败: %w", err)
+	}
+	if err := backfillTokenUsage(db); err != nil {
+		return err
 	}
 	return nil
 }
@@ -526,12 +554,225 @@ func migrateJSONL(db *sql.DB, path string) error {
 		if entry.ThreadID == "" {
 			entry.ThreadID = entry.ID
 		}
+		if entry.InputTokens == 0 && entry.OutputTokens == 0 {
+			entry.InputTokens, entry.OutputTokens = extractTokenUsageFromRaw(entry.RawOutput)
+		}
 		_ = insertEntry(db, entry)
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("读取旧 JSONL 日志失败: %w", err)
 	}
 	return nil
+}
+
+func pruneJSONLThread(path, threadID string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("打开旧 JSONL 日志失败: %w", err)
+	}
+
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".runs-*.jsonl")
+	if err != nil {
+		_ = f.Close()
+		return fmt.Errorf("创建临时 JSONL 日志失败: %w", err)
+	}
+	tmpName := tmp.Name()
+	removed := false
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		keep := true
+		var entry LogEntry
+		if err := json.Unmarshal(line, &entry); err == nil && entry.ID != "" {
+			entryThreadID := entry.ThreadID
+			if entryThreadID == "" {
+				entryThreadID = entry.ID
+			}
+			if entryThreadID == threadID {
+				keep = false
+				removed = true
+			}
+		}
+		if keep {
+			if _, err := tmp.Write(line); err != nil {
+				_ = f.Close()
+				_ = tmp.Close()
+				_ = os.Remove(tmpName)
+				return fmt.Errorf("写入临时 JSONL 日志失败: %w", err)
+			}
+			if _, err := tmp.WriteString("\n"); err != nil {
+				_ = f.Close()
+				_ = tmp.Close()
+				_ = os.Remove(tmpName)
+				return fmt.Errorf("写入临时 JSONL 日志失败: %w", err)
+			}
+		}
+	}
+	scanErr := scanner.Err()
+	closeErr := f.Close()
+	tmpCloseErr := tmp.Close()
+	if scanErr != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("读取旧 JSONL 日志失败: %w", scanErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("关闭旧 JSONL 日志失败: %w", closeErr)
+	}
+	if tmpCloseErr != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("关闭临时 JSONL 日志失败: %w", tmpCloseErr)
+	}
+	if !removed {
+		_ = os.Remove(tmpName)
+		return nil
+	}
+
+	backup := path + ".bak-delete"
+	_ = os.Remove(backup)
+	if err := os.Rename(path, backup); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("备份旧 JSONL 日志失败: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Rename(backup, path)
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("替换旧 JSONL 日志失败: %w", err)
+	}
+	_ = os.Remove(backup)
+	return nil
+}
+
+func backfillTokenUsage(db *sql.DB) error {
+	rows, err := db.Query(`SELECT id, raw_output FROM runs WHERE input_tokens = 0 AND output_tokens = 0 AND raw_output <> ''`)
+	if err != nil {
+		return fmt.Errorf("读取 token 回填数据失败: %w", err)
+	}
+	type tokenUpdate struct {
+		id     string
+		input  int
+		output int
+	}
+	var updates []tokenUpdate
+	for rows.Next() {
+		var id string
+		var raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("解析 token 回填数据失败: %w", err)
+		}
+		input, output := extractTokenUsageFromRaw(raw)
+		if input > 0 || output > 0 {
+			updates = append(updates, tokenUpdate{id: id, input: input, output: output})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("读取 token 回填数据失败: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭 token 回填数据失败: %w", err)
+	}
+	for _, update := range updates {
+		if _, err := db.Exec(`UPDATE runs SET input_tokens = ?, output_tokens = ? WHERE id = ?`, update.input, update.output, update.id); err != nil {
+			return fmt.Errorf("写入 token 回填数据失败: %w", err)
+		}
+	}
+	return nil
+}
+
+type tokenUsage struct {
+	input  int
+	output int
+}
+
+func extractTokenUsageFromRaw(raw string) (int, int) {
+	usageByMessage := map[string]tokenUsage{}
+	fallback := tokenUsage{}
+
+	scanner := bufio.NewScanner(strings.NewReader(raw))
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			continue
+		}
+		recordTokenUsage(obj, usageByMessage, &fallback)
+		if event, ok := obj["event"].(map[string]interface{}); ok {
+			recordTokenUsage(event, usageByMessage, &fallback)
+		}
+	}
+
+	if len(usageByMessage) == 0 {
+		return fallback.input, fallback.output
+	}
+	total := tokenUsage{}
+	for _, usage := range usageByMessage {
+		total.input += usage.input
+		total.output += usage.output
+	}
+	return total.input, total.output
+}
+
+func recordTokenUsage(obj map[string]interface{}, usageByMessage map[string]tokenUsage, fallback *tokenUsage) {
+	if msg, ok := obj["message"].(map[string]interface{}); ok {
+		if usage, ok := msg["usage"].(map[string]interface{}); ok {
+			id, _ := msg["id"].(string)
+			tokenUsage := tokenUsageFromMap(usage)
+			if id != "" {
+				usageByMessage[id] = tokenUsage
+				return
+			}
+			if tokenUsage.input > fallback.input {
+				fallback.input = tokenUsage.input
+			}
+			if tokenUsage.output > fallback.output {
+				fallback.output = tokenUsage.output
+			}
+		}
+	}
+	if usage, ok := obj["usage"].(map[string]interface{}); ok {
+		tokenUsage := tokenUsageFromMap(usage)
+		if tokenUsage.input > fallback.input {
+			fallback.input = tokenUsage.input
+		}
+		if tokenUsage.output > fallback.output {
+			fallback.output = tokenUsage.output
+		}
+	}
+}
+
+func tokenUsageFromMap(usage map[string]interface{}) tokenUsage {
+	return tokenUsage{
+		input:  intFromJSONNumber(usage["input_tokens"]),
+		output: intFromJSONNumber(usage["output_tokens"]),
+	}
+}
+
+func intFromJSONNumber(value interface{}) int {
+	switch v := value.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case json.Number:
+		i, _ := v.Int64()
+		return int(i)
+	default:
+		return 0
+	}
 }
 
 func truncate(value string, limit int) string {

@@ -199,10 +199,11 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 	// Emit start event
 	runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 		Type:            "status",
-		Text:            runStartText(req),
+		Text:            runStartText(req, startTime),
 		RunID:           runID,
 		ThreadID:        req.ThreadID,
 		ClaudeSessionID: req.ClaudeSessionID,
+		Timestamp:       startTime.Format(time.RFC3339),
 	})
 
 	var wg sync.WaitGroup
@@ -300,6 +301,9 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		claudeSessionID = req.ClaudeSessionID
 	}
 
+	// Collect token usage from parser.
+	inputTokens, outputTokens := parser.usage()
+
 	// Save log BEFORE emitting done so loadRecentLogs() sees it immediately.
 	log := RunLog{
 		ID:              runID,
@@ -314,10 +318,9 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		RawOutput:       rawOutput,
 		ExitCode:        exitCode,
 		DurationMS:      durationMS,
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
 	}
-
-	// Collect token usage from parser
-	inputTokens, outputTokens := parser.usage()
 
 	if err := logstore.AppendLog(logstore.LogEntry{
 		ID:              log.ID,
@@ -332,6 +335,8 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		RawOutput:       log.RawOutput,
 		ExitCode:        log.ExitCode,
 		DurationMS:      log.DurationMS,
+		InputTokens:     log.InputTokens,
+		OutputTokens:    log.OutputTokens,
 	}); err != nil {
 		runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
 			Type:            "stderr",
@@ -343,7 +348,7 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 	}
 
 	// Emit done event
-	doneText := fmt.Sprintf("运行结束 · exit=%d · 耗时 %s", exitCode, formatDuration(durationMS))
+	doneText := fmt.Sprintf("耗时 %s", formatDuration(durationMS))
 	if inputTokens > 0 || outputTokens > 0 {
 		doneText += fmt.Sprintf(" · 输入 %d token · 输出 %d token", inputTokens, outputTokens)
 	}
@@ -353,6 +358,16 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		RunID:           runID,
 		ThreadID:        req.ThreadID,
 		ClaudeSessionID: claudeSessionID,
+		Timestamp:       time.Now().Format(time.RFC3339),
+		Meta: map[string]interface{}{
+			"exit_code":      exitCode,
+			"duration_ms":    durationMS,
+			"input_tokens":   inputTokens,
+			"output_tokens":  outputTokens,
+			"model":          req.Model,
+			"permissionMode": req.PermissionMode,
+			"created_at":     log.CreatedAt,
+		},
 	})
 }
 
@@ -365,6 +380,7 @@ type streamParser struct {
 	lastMeta        map[string]interface{}
 	inputTokens     int
 	outputTokens    int
+	usageByMessage  map[string]tokenUsage
 }
 
 type toolTrace struct {
@@ -372,15 +388,30 @@ type toolTrace struct {
 	input strings.Builder
 }
 
+type tokenUsage struct {
+	input  int
+	output int
+}
+
 func newStreamParser() *streamParser {
 	return &streamParser{
-		tools:        map[int]*toolTrace{},
-		thinking:     map[int]bool{},
-		thinkingText: map[int]strings.Builder{},
+		tools:          map[int]*toolTrace{},
+		thinking:       map[int]bool{},
+		thinkingText:   map[int]strings.Builder{},
+		usageByMessage: map[string]tokenUsage{},
 	}
 }
 
 func (p *streamParser) usage() (int, int) {
+	if len(p.usageByMessage) > 0 {
+		inputTokens := 0
+		outputTokens := 0
+		for _, usage := range p.usageByMessage {
+			inputTokens += usage.input
+			outputTokens += usage.output
+		}
+		return inputTokens, outputTokens
+	}
 	return p.inputTokens, p.outputTokens
 }
 
@@ -419,9 +450,20 @@ func (p *streamParser) extract(line string) (string, string) {
 		return "display", line + "\n"
 	}
 
-	eventType, _ := obj["type"].(string)
 	if sessionID, ok := obj["session_id"].(string); ok && sessionID != "" {
 		p.sessionID = sessionID
+	}
+	if event, ok := obj["event"].(map[string]interface{}); ok {
+		obj = event
+	}
+	if sessionID, ok := obj["session_id"].(string); ok && sessionID != "" {
+		p.sessionID = sessionID
+	}
+	p.recordUsage(obj)
+
+	eventType, _ := obj["type"].(string)
+	if eventType == "message_start" {
+		p.lastMessageText = ""
 	}
 	idx := blockIndex(obj)
 
@@ -560,25 +602,6 @@ func (p *streamParser) extract(line string) (string, string) {
 				return "display", text
 			}
 		}
-		// Parse usage from message
-		if msgUsage, ok := msg["usage"].(map[string]interface{}); ok {
-			if it, ok := msgUsage["input_tokens"].(float64); ok {
-				p.inputTokens = int(it)
-			}
-			if ot, ok := msgUsage["output_tokens"].(float64); ok {
-				p.outputTokens = int(ot)
-			}
-		}
-	}
-
-	// Parse usage from top-level result
-	if usage, ok := obj["usage"].(map[string]interface{}); ok {
-		if it, ok := usage["input_tokens"].(float64); ok {
-			p.inputTokens = int(it)
-		}
-		if ot, ok := usage["output_tokens"].(float64); ok {
-			p.outputTokens = int(ot)
-		}
 	}
 
 	if result, ok := obj["result"].(string); ok && result != "" {
@@ -598,11 +621,62 @@ func (p *streamParser) extract(line string) (string, string) {
 	return "", ""
 }
 
-func runStartText(req RunRequest) string {
-	if req.ClaudeSessionID != "" {
-		return fmt.Sprintf("继续线程：%s / %s，prompt %d 字符\n", req.Model, req.PermissionMode, len([]rune(req.Prompt)))
+func (p *streamParser) recordUsage(obj map[string]interface{}) {
+	if msg, ok := obj["message"].(map[string]interface{}); ok {
+		if msgUsage, ok := msg["usage"].(map[string]interface{}); ok {
+			id, _ := msg["id"].(string)
+			usage := tokenUsageFromMap(msgUsage)
+			if id != "" {
+				p.usageByMessage[id] = usage
+				return
+			}
+			p.recordFallbackUsage(usage)
+		}
 	}
-	return fmt.Sprintf("新建线程：%s / %s，prompt %d 字符\n", req.Model, req.PermissionMode, len([]rune(req.Prompt)))
+	if usage, ok := obj["usage"].(map[string]interface{}); ok {
+		p.recordFallbackUsage(tokenUsageFromMap(usage))
+	}
+	if delta, ok := obj["delta"].(map[string]interface{}); ok {
+		if usage, ok := delta["usage"].(map[string]interface{}); ok {
+			p.recordFallbackUsage(tokenUsageFromMap(usage))
+		}
+	}
+}
+
+func (p *streamParser) recordFallbackUsage(usage tokenUsage) {
+	if usage.input > p.inputTokens {
+		p.inputTokens = usage.input
+	}
+	if usage.output > p.outputTokens {
+		p.outputTokens = usage.output
+	}
+}
+
+func tokenUsageFromMap(usage map[string]interface{}) tokenUsage {
+	return tokenUsage{
+		input:  intFromJSONNumber(usage["input_tokens"]),
+		output: intFromJSONNumber(usage["output_tokens"]),
+	}
+}
+
+func intFromJSONNumber(value interface{}) int {
+	switch v := value.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case json.Number:
+		i, _ := v.Int64()
+		return int(i)
+	default:
+		return 0
+	}
+}
+
+func runStartText(req RunRequest, startTime time.Time) string {
+	return fmt.Sprintf("model: %s / mode: %s / time: %s\n", req.Model, req.PermissionMode, startTime.Format(time.RFC3339))
 }
 
 func blockIndex(obj map[string]interface{}) int {

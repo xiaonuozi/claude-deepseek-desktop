@@ -58,6 +58,67 @@ function createLocalID(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function toFiniteNumber(value: any): number {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : NaN;
+}
+
+function formatDurationMS(ms: any): string {
+  const durationMS = toFiniteNumber(ms);
+  if (!Number.isFinite(durationMS)) return '';
+  const wholeMS = Math.max(0, Math.round(durationMS));
+  if (wholeMS < 1000) return `${wholeMS}ms`;
+  const totalSeconds = Math.floor(wholeMS / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m${seconds}s`;
+}
+
+function formatTokenNumber(value: any): string {
+  const tokenCount = toFiniteNumber(value);
+  if (!Number.isFinite(tokenCount) || tokenCount <= 0) return '0';
+  return Math.round(tokenCount).toLocaleString('en-US');
+}
+
+function buildRunStats(durationMS: any, inputTokens: any, outputTokens: any): string {
+  const duration = formatDurationMS(durationMS);
+  const input = toFiniteNumber(inputTokens);
+  const output = toFiniteNumber(outputTokens);
+  const hasTokens = (Number.isFinite(input) && input > 0) || (Number.isFinite(output) && output > 0);
+  const parts: string[] = [];
+  if (duration) parts.push(`耗时: ${duration}`);
+  parts.push(hasTokens ? `token: 输入 ${formatTokenNumber(input)} / 输出 ${formatTokenNumber(output)}` : 'token: 未记录');
+  return parts.join(' / ');
+}
+
+function buildRunMetaText(model: string, permissionMode: string, createdAt: string, durationMS: any, inputTokens: any, outputTokens: any): string {
+  return `model: ${model} / mode: ${permissionMode} / time: ${createdAt} / ${buildRunStats(durationMS, inputTokens, outputTokens)}\n`;
+}
+
+function attachRunStats(text: string, stats: string): string {
+  const base = text.trim().replace(/\s+\/\s+(duration|耗时):.*$/u, '');
+  return `${base} / ${stats}\n`;
+}
+
+function mergeDoneStats(lines: OutputLine[], event: OutputLine): OutputLine[] {
+  const stats = buildRunStats(event.meta?.duration_ms, event.meta?.input_tokens, event.meta?.output_tokens);
+  let updated = false;
+  const next = lines.map((line) => {
+    if (!updated && line.run_id === event.run_id && (line.type === 'status' || line.type === 'system')) {
+      updated = true;
+      return {
+        ...line,
+        text: attachRunStats(line.text, stats),
+        meta: { ...(line.meta || {}), ...(event.meta || {}) },
+      };
+    }
+    return line;
+  });
+  if (updated) return next;
+  return [...next, { ...event, type: 'status', text: `${stats}\n` }];
+}
+
 const MODELS = [
   { value: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro' },
   { value: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash' },
@@ -266,7 +327,7 @@ function App() {
   const [baseUrl, setBaseUrl] = useState('https://api.deepseek.com/anthropic');
   const [model, setModel] = useState('deepseek-v4-pro');
   const [customModel, setCustomModel] = useState('');
-  const [permissionMode, setPermissionMode] = useState('default');
+  const [permissionMode, setPermissionMode] = useState('bypassPermissions');
   const [projectPath, setProjectPath] = useState('');
   const [language, setLanguage] = useState('中文');
   const [prompt, setPrompt] = useState('');
@@ -281,6 +342,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [logPath, setLogPath] = useState('');
   const [showAllThreads, setShowAllThreads] = useState(false);
+  const [showProjectThreads, setShowProjectThreads] = useState(true);
 
   const [recentLogs, setRecentLogs] = useState<LogEntry[]>([]);
   const [activeThreadID, setActiveThreadID] = useState('');
@@ -336,11 +398,19 @@ function App() {
           ]);
         }
 
-      if (event.type === 'display' || event.type === 'status' || event.type === 'stderr' || event.type === 'done' ||
+        if (event.type === 'display' || event.type === 'status' || event.type === 'stderr' ||
           event.type === 'thinking-start' || event.type === 'thinking-delta' || event.type === 'thinking-end' ||
           event.type === 'tool-start' || event.type === 'tool-end' || event.type === 'tool-result') {
-        setOutputLines((prev) => [...prev, event]);
-      }
+          setOutputLines((prev) => [...prev, event]);
+        }
+
+        if (event.type === 'done') {
+          setOutputLines((prev) => mergeDoneStats(prev, event));
+          const exitCode = toFiniteNumber(event.meta?.exit_code);
+          if (Number.isFinite(exitCode) && exitCode !== 0) {
+            setError(`运行退出码: ${exitCode}`);
+          }
+        }
 
         if (event.type === 'error') {
           log('ERROR', 'run-event error: ' + event.text);
@@ -388,6 +458,9 @@ function App() {
   const activeLog = activeThreadID
     ? recentLogs.find((log) => (log.thread_id || log.id) === activeThreadID)
     : null;
+  const visibleLogs = projectPath
+    ? recentLogs.filter((log) => !log.project_path || log.project_path === projectPath)
+    : recentLogs;
   const outputSegments = buildOutputSegments(outputLines);
   const conversationTitle = activeLog
     ? truncate(activeLog.prompt || '历史运行', 26)
@@ -404,6 +477,7 @@ function App() {
       if (dir) {
         log('INFO', 'handleSelectDir: selected ' + dir);
         setProjectPath(dir);
+        setShowProjectThreads(true);
         setActiveThreadID(createLocalID('new'));
         setActiveSessionID('');
         setOutputLines([]);
@@ -435,9 +509,13 @@ function App() {
     setActiveThreadID(createLocalID('new'));
   };
 
+  const handleToggleProjectThreads = () => {
+    setShowProjectThreads((current) => !current);
+  };
+
   const handleProjectThread = async () => {
     if (!projectPath) {
-      setError('请先点击项目右侧的 ↗ 选择项目目录');
+      await handleSelectDir();
       return;
     }
     setOutputLines([]);
@@ -446,6 +524,7 @@ function App() {
     setActiveThreadID(createLocalID('new'));
     setActiveSessionID('');
     setPrompt('');
+    setShowProjectThreads(true);
     setViewMode('output');
   };
 
@@ -484,7 +563,7 @@ function App() {
         setRawOutput([]);
         setViewMode('output');
       }
-      loadRecentLogs();
+      await loadRecentLogs();
     } catch (err: any) {
       log('ERROR', 'handleDeleteThread error: ' + String(err));
       setError('删除失败: ' + err);
@@ -564,9 +643,19 @@ function App() {
     setError(lastLog.exit_code === 0 ? '' : `历史运行退出码: ${lastLog.exit_code}`);
     setOutputLines(threadLogs.flatMap((entry) => [
       { type: 'user', text: entry.prompt, run_id: entry.id, thread_id: threadID },
-      { type: 'system', text: `model: ${entry.model} / mode: ${entry.permission_mode} / time: ${entry.created_at}\n`, run_id: entry.id, thread_id: threadID },
+      {
+        type: 'system',
+        text: buildRunMetaText(entry.model, entry.permission_mode, entry.created_at, entry.duration_ms, entry.input_tokens, entry.output_tokens),
+        run_id: entry.id,
+        thread_id: threadID,
+        meta: {
+          exit_code: entry.exit_code,
+          duration_ms: entry.duration_ms,
+          input_tokens: entry.input_tokens,
+          output_tokens: entry.output_tokens,
+        },
+      },
       { type: 'display', text: entry.display_output || '(empty)\n', run_id: entry.id, thread_id: threadID },
-      { type: 'done', text: `\nexit_code=${entry.exit_code}, duration=${entry.duration_ms} ms\n`, run_id: entry.id, thread_id: threadID },
     ]));
   };
 
@@ -610,23 +699,22 @@ function App() {
             </div>
           </div>
 
-          <button className="project-row" onClick={handleProjectThread} disabled={isRunning} title={projectPath ? '在该项目中新建线程' : '选择项目目录'}>
-            <span className="folder-icon">▱</span>
-            <span>{projectName}</span>
-          </button>
+          <div className="project-row-wrap">
+            <button className="project-row" onClick={handleToggleProjectThreads} title={showProjectThreads ? '收起线程' : '展开线程'}>
+              <span className="project-toggle">{showProjectThreads ? '▾' : '▸'}</span>
+              <span className="folder-icon">▱</span>
+              <span className="project-name">{projectName}</span>
+            </button>
+            <button className="project-new-thread" onClick={handleProjectThread} disabled={isRunning} title={projectPath ? '开启新线程' : '选择项目目录'}>+</button>
+          </div>
         </section>
 
-        <section className="sidebar-group history-group">
+        {showProjectThreads && <section className="sidebar-group history-group">
           <div className="run-list">
-            {activeThreadID.startsWith('new-') && (
-              <button className="history-row active" onClick={handleNewTask}>
-                <span>新对话</span>
-              </button>
-            )}
-            {recentLogs.length === 0 && !activeThreadID.startsWith('new-') ? (
+            {visibleLogs.length === 0 ? (
               <div className="empty-list">暂无聊天</div>
             ) : (
-              (showAllThreads ? recentLogs : recentLogs.slice(0, 5)).map((log) => (
+              (showAllThreads ? visibleLogs : visibleLogs.slice(0, 5)).map((log) => (
                 <button
                   key={log.id}
                   className={`history-row ${(log.thread_id || log.id) === activeThreadID ? 'active' : ''}`}
@@ -638,13 +726,13 @@ function App() {
                 </button>
               ))
             )}
-            {recentLogs.length > 5 && (
+            {visibleLogs.length > 5 && (
               <button className="expand-toggle" onClick={() => setShowAllThreads(!showAllThreads)}>
-                {showAllThreads ? '收起' : `展开更多 (${recentLogs.length - 5})`}
+                {showAllThreads ? '收起' : `展开更多 (${visibleLogs.length - 5})`}
               </button>
             )}
           </div>
-        </section>
+        </section>}
 
         <button className="settings-entry" onClick={() => setShowSettings(true)}>
           <span>⚙</span>设置

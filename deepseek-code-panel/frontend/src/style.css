@@ -104,6 +104,7 @@ button {
 .sidebar-nav button,
 .settings-entry,
 .project-row,
+.project-new-thread,
 .history-row {
   display: flex;
   align-items: center;
@@ -125,6 +126,7 @@ button {
 .sidebar-nav button:hover,
 .settings-entry:hover,
 .project-row:hover,
+.project-new-thread:hover,
 .history-row:hover,
 .history-row.active {
   background: var(--sidebar-hover);
@@ -176,13 +178,41 @@ button {
   color: var(--ink);
 }
 
+.project-row-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  gap: 4px;
+  align-items: center;
+}
+
 .project-row {
-  gap: 8px;
+  gap: 7px;
   height: 32px;
   padding: 0 10px;
 }
 
-.project-row span:last-child,
+.project-toggle {
+  width: 12px;
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+.project-new-thread {
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.project-new-thread:hover {
+  color: var(--ink);
+}
+
+.project-name,
 .history-row span {
   min-width: 0;
   overflow: hidden;
@@ -273,8 +303,9 @@ button {
 .settings-entry {
   gap: 10px;
   height: 34px;
-  margin-top: 10px;
+  margin-top: auto;
   padding: 0 10px;
+  flex: 0 0 auto;
 }
 
 .settings-entry span {

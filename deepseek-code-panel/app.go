@@ -45,6 +45,7 @@ func (a *App) CheckClaudeInstalled() (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "claude", "--version")
+	configureCommand(cmd)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("未检测到 claude CLI，请先安装并确认 claude --version 可用")
@@ -129,7 +130,7 @@ func (a *App) StartRun(req runner.RunRequest) (string, error) {
 		req.Model = "deepseek-v4-pro"
 	}
 	if req.PermissionMode == "" {
-		req.PermissionMode = "default"
+		req.PermissionMode = "bypassPermissions"
 	}
 	if req.Language == "" {
 		req.Language = "中文"
