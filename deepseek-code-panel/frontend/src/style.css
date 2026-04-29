@@ -126,6 +126,7 @@ button {
 .sidebar-nav button:hover,
 .settings-entry:hover,
 .project-row:hover,
+.project-row.active,
 .project-new-thread:hover,
 .history-row:hover,
 .history-row.active {
@@ -145,6 +146,10 @@ button {
 }
 
 .project-group {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
   padding-bottom: 8px;
 }
 
@@ -185,10 +190,30 @@ button {
   align-items: center;
 }
 
+.project-list {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+}
+
+.project-block {
+  margin-bottom: 3px;
+}
+
 .project-row {
   gap: 7px;
   height: 32px;
   padding: 0 10px;
+}
+
+.project-row.active {
+  font-weight: 600;
+}
+
+.project-row.placeholder {
+  color: var(--muted);
+  font-weight: 400;
 }
 
 .project-toggle {
@@ -244,11 +269,19 @@ button {
 }
 
 .run-list {
-  height: 100%;
   min-height: 0;
-  overflow-y: auto;
+  overflow-y: visible;
   overflow-x: hidden;
   padding-right: 2px;
+}
+
+.history-group .run-list {
+  height: 100%;
+  overflow-y: auto;
+}
+
+.project-run-list {
+  padding: 1px 0 4px;
 }
 
 .history-row {

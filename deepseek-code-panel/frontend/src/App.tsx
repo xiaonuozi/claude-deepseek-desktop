@@ -138,6 +138,47 @@ const MAX_THINKING_CHARS = 80_000;
 const MAX_TOOL_RESULT_CHARS = 120_000;
 const SCROLL_BOTTOM_THRESHOLD = 120;
 const TRUNCATED_NOTE = '\n\n[内容过长，界面已截断]\n';
+const PROJECT_PATHS_SETTING = 'project_paths';
+
+function projectPathKey(value: string): string {
+  return value.trim().replace(/[\\/]+$/, '').toLocaleLowerCase();
+}
+
+function sameProjectPath(left: string, right: string): boolean {
+  const leftKey = projectPathKey(left);
+  const rightKey = projectPathKey(right);
+  return !!leftKey && !!rightKey && leftKey === rightKey;
+}
+
+function projectDisplayName(path: string): string {
+  return path ? path.split(/[\\/]/).filter(Boolean).pop() || path : 'Claude Tools';
+}
+
+function mergeProjectPaths(current: string[], additions: string[]): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  [...current, ...additions].forEach((path) => {
+    const cleanPath = path.trim();
+    const key = projectPathKey(cleanPath);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    merged.push(cleanPath);
+  });
+  return merged;
+}
+
+function parseStoredProjectPaths(value: string): string[] {
+  if (!value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item): item is string => typeof item === 'string');
+    }
+  } catch {
+    // Older local builds never stored this setting; a newline fallback keeps manual edits readable.
+  }
+  return value.split('\n').filter(Boolean);
+}
 
 function compactText(value: string, max = 96): string {
   const text = value.replace(/\s+/g, ' ').trim();
@@ -566,6 +607,7 @@ function App() {
   const [customModel, setCustomModel] = useState('');
   const [permissionMode, setPermissionMode] = useState('bypassPermissions');
   const [projectPath, setProjectPath] = useState('');
+  const [projectPaths, setProjectPaths] = useState<string[]>([]);
   const [language, setLanguage] = useState('中文');
   const [prompt, setPrompt] = useState('');
 
@@ -575,8 +617,8 @@ function App() {
   const [claudeVersion, setClaudeVersion] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [logPath, setLogPath] = useState('');
-  const [showAllThreads, setShowAllThreads] = useState(false);
-  const [showProjectThreads, setShowProjectThreads] = useState(true);
+  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
+  const [showAllThreadsByProject, setShowAllThreadsByProject] = useState<Record<string, boolean>>({});
   const [showScrollBottom, setShowScrollBottom] = useState(false);
 
   const [recentLogs, setRecentLogs] = useState<LogEntry[]>([]);
@@ -688,11 +730,39 @@ function App() {
     });
   }, []);
 
+  const rememberProjectPaths = useCallback((paths: string[]) => {
+    setProjectPaths((current) => {
+      const next = mergeProjectPaths(current, paths);
+      if (next.length !== current.length || next.some((path, index) => path !== current[index])) {
+        SaveSetting(PROJECT_PATHS_SETTING, JSON.stringify(next)).catch(() => {});
+        return next;
+      }
+      return current;
+    });
+  }, []);
+
+  const activateProject = useCallback((path: string, expand = true) => {
+    const cleanPath = path.trim();
+    if (!cleanPath) return;
+    rememberProjectPaths([cleanPath]);
+    setProjectPath(cleanPath);
+    if (expand) {
+      const key = projectPathKey(cleanPath);
+      setExpandedProjects((current) => ({ ...current, [key]: true }));
+    }
+  }, [rememberProjectPaths]);
+
   const loadRecentLogs = useCallback(async () => {
     try {
       const logs = await GetRecentLogs(30);
-      setRecentLogs(logs || []);
-      setProjectPath((current) => current || logs?.[0]?.project_path || '');
+      const nextLogs = logs || [];
+      const logProjectPaths = nextLogs.map((entry) => entry.project_path || '').filter(Boolean);
+      setRecentLogs(nextLogs);
+      setProjectPaths((current) => {
+        const next = mergeProjectPaths(current, logProjectPaths);
+        return next.length === current.length && next.every((path, index) => path === current[index]) ? current : next;
+      });
+      setProjectPath((current) => current || logProjectPaths[0] || '');
     } catch {
       // Keep the chat usable even if the local log file cannot be read.
     }
@@ -708,6 +778,17 @@ function App() {
       .catch(() => {});
     LoadSetting('api_key').then((v) => { if (v) setApiKey(v); }).catch(() => {});
     LoadSetting('base_url').then((v) => { if (v) setBaseUrl(v); }).catch(() => {});
+    LoadSetting(PROJECT_PATHS_SETTING)
+      .then((v) => {
+        const storedPaths = parseStoredProjectPaths(v || '');
+        if (!storedPaths.length) return;
+        setProjectPaths((current) => {
+          const next = mergeProjectPaths(current, storedPaths);
+          return next.length === current.length && next.every((path, index) => path === current[index]) ? current : next;
+        });
+        setProjectPath((current) => current || storedPaths[0] || '');
+      })
+      .catch(() => {});
   }, [loadRecentLogs]);
 
   // Persist settings on change
@@ -807,7 +888,7 @@ function App() {
 
   const effectiveModel = customModel.trim() || model;
   const selectedPermissionLabel = PERMISSION_MODES.find((item) => item.value === permissionMode)?.label || permissionMode;
-  const projectName = projectPath ? projectPath.split(/[\\/]/).filter(Boolean).pop() || projectPath : 'Claude Tools';
+  const projectName = projectDisplayName(projectPath);
   const pendingThreadIDs = new Set(Object.keys(pendingLogs));
   const mergedLogs = [
     ...Object.values(pendingLogs),
@@ -816,9 +897,12 @@ function App() {
   const activeLog = activeThreadID
     ? mergedLogs.find((log) => (log.thread_id || log.id) === activeThreadID)
     : null;
-  const visibleLogs = projectPath
-    ? mergedLogs.filter((log) => !log.project_path || log.project_path === projectPath)
-    : mergedLogs;
+  const knownProjectPaths = useMemo(() => (
+    mergeProjectPaths(projectPaths, [
+      projectPath,
+      ...mergedLogs.map((log) => log.project_path || ''),
+    ])
+  ), [projectPath, projectPaths, mergedLogs]);
   const outputSegments = useMemo(() => buildOutputSegments(outputLines), [outputLines]);
   const conversationTitle = activeLog
     ? truncate(activeLog.prompt || '历史运行', 26)
@@ -828,14 +912,22 @@ function App() {
       ? truncate(prompt.trim(), 26)
       : '新对话';
 
+  const getProjectLogs = useCallback((path: string) => {
+    if (!path) return mergedLogs;
+    return mergedLogs.filter((entry) => (
+      entry.project_path
+        ? sameProjectPath(entry.project_path, path)
+        : sameProjectPath(path, projectPath)
+    ));
+  }, [mergedLogs, projectPath]);
+
   const handleSelectDir = async () => {
     log('INFO', 'handleSelectDir: opening directory picker');
     try {
       const dir = await SelectProjectDirectory();
       if (dir) {
         log('INFO', 'handleSelectDir: selected ' + dir);
-        setProjectPath(dir);
-        setShowProjectThreads(true);
+        activateProject(dir, true);
         switchToThread(createLocalID('new'));
         setPrompt('');
       }
@@ -862,17 +954,23 @@ function App() {
     switchToThread(createLocalID('new'));
   };
 
-  const handleToggleProjectThreads = () => {
-    setShowProjectThreads((current) => !current);
+  const handleToggleProjectThreads = (path: string) => {
+    const key = projectPathKey(path);
+    if (!sameProjectPath(path, projectPath)) {
+      activateProject(path, true);
+      return;
+    }
+    setExpandedProjects((current) => ({ ...current, [key]: !(current[key] ?? true) }));
   };
 
-  const handleProjectThread = async () => {
-    if (!projectPath) {
+  const handleProjectThread = async (path?: string) => {
+    const targetPath = (path || projectPath).trim();
+    if (!targetPath) {
       await handleSelectDir();
       return;
     }
+    activateProject(targetPath, true);
     setPrompt('');
-    setShowProjectThreads(true);
     switchToThread(createLocalID('new'));
   };
 
@@ -884,7 +982,7 @@ function App() {
         setError('该历史记录没有项目路径，请使用右上角按钮选择项目');
         return;
       }
-      setProjectPath(threadProjectPath);
+      activateProject(threadProjectPath, true);
       setPrompt('');
       switchToThread(createLocalID('new'));
     } catch (err: any) {
@@ -1050,7 +1148,7 @@ function App() {
       activeThreadIDRef.current = threadID;
       setActiveThreadID(threadID);
       setActiveSessionID(liveBuffers.sessionID || log.claude_session_id || '');
-      setProjectPath(log.project_path || projectPath);
+      activateProject(log.project_path || projectPath, true);
       setOutputLines(liveBuffers.outputLines);
       setRawOutput(liveBuffers.rawOutput);
       setError(liveBuffers.error);
@@ -1095,7 +1193,7 @@ function App() {
     setThreadBuffers(threadBuffersRef.current);
     setActiveThreadID(threadID);
     setActiveSessionID(nextBuffers.sessionID);
-    setProjectPath(lastLog.project_path || log.project_path);
+    activateProject(lastLog.project_path || log.project_path, true);
     setRawOutput(nextBuffers.rawOutput);
     setError(nextBuffers.error);
     setOutputLines(nextBuffers.outputLines);
@@ -1136,49 +1234,80 @@ function App() {
           <div className="group-heading">
             <span>项目</span>
             <div className="group-actions">
-              <button onClick={handleSelectDir} title="选择项目目录">↗</button>
+              <button onClick={handleSelectDir} title="添加项目目录">↗</button>
               <button onClick={handleClear} disabled={activeThreadRunning} title="清空输出">≡</button>
             </div>
           </div>
 
-          <div className="project-row-wrap">
-            <button className="project-row" onClick={handleToggleProjectThreads} title={showProjectThreads ? '收起线程' : '展开线程'}>
-              <span className="project-toggle">{showProjectThreads ? '▾' : '▸'}</span>
-              <span className="folder-icon"><FolderIcon /></span>
-              <span className="project-name">{projectName}</span>
-            </button>
-            <button className="project-new-thread" onClick={handleProjectThread} title={projectPath ? '开启新线程' : '选择项目目录'}>+</button>
-          </div>
-        </section>
-
-        {showProjectThreads && <section className="sidebar-group history-group">
-          <div className="run-list">
-            {visibleLogs.length === 0 ? (
-              <div className="empty-list">暂无聊天</div>
+          <div className="project-list">
+            {knownProjectPaths.length === 0 ? (
+              <div className="project-row-wrap">
+                <button className="project-row placeholder" onClick={handleSelectDir} title="选择项目目录">
+                  <span className="project-toggle">▸</span>
+                  <span className="folder-icon"><FolderIcon /></span>
+                  <span className="project-name">选择项目目录</span>
+                </button>
+                <button className="project-new-thread" onClick={() => handleProjectThread()} title="选择项目目录">+</button>
+              </div>
             ) : (
-              (showAllThreads ? visibleLogs : visibleLogs.slice(0, 5)).map((log) => {
-                const threadID = log.thread_id || log.id;
-                const threadRunning = !!runningByThread[threadID];
+              knownProjectPaths.map((path) => {
+                const key = projectPathKey(path);
+                const expanded = expandedProjects[key] ?? sameProjectPath(path, projectPath);
+                const projectLogs = getProjectLogs(path);
+                const showAllThreads = !!showAllThreadsByProject[key];
+                const visibleProjectLogs = showAllThreads ? projectLogs : projectLogs.slice(0, 5);
                 return (
-                  <button
-                    key={threadID}
-                    className={`history-row ${threadID === activeThreadID ? 'active' : ''}`}
-                    onClick={() => handleViewLog(log)}
-                  >
-                    <span>{truncate(log.prompt || '(empty prompt)', 28)}</span>
-                    <time>{threadRunning ? '运行中' : formatAge(log.created_at)}</time>
-                    {!threadRunning && <span className="delete-thread" onClick={(e) => handleDeleteThread(log, e)} title="删除线程">×</span>}
-                  </button>
+                  <div className="project-block" key={key}>
+                    <div className="project-row-wrap">
+                      <button
+                        className={`project-row${sameProjectPath(path, projectPath) ? ' active' : ''}`}
+                        onClick={() => handleToggleProjectThreads(path)}
+                        title={expanded ? '收起线程' : '展开线程'}
+                      >
+                        <span className="project-toggle">{expanded ? '▾' : '▸'}</span>
+                        <span className="folder-icon"><FolderIcon /></span>
+                        <span className="project-name" title={path}>{projectDisplayName(path)}</span>
+                      </button>
+                      <button className="project-new-thread" onClick={() => handleProjectThread(path)} title="开启新线程">+</button>
+                    </div>
+
+                    {expanded && (
+                      <div className="run-list project-run-list">
+                        {projectLogs.length === 0 ? (
+                          <div className="empty-list">暂无聊天</div>
+                        ) : (
+                          visibleProjectLogs.map((log) => {
+                            const threadID = log.thread_id || log.id;
+                            const threadRunning = !!runningByThread[threadID];
+                            return (
+                              <button
+                                key={threadID}
+                                className={`history-row ${threadID === activeThreadID ? 'active' : ''}`}
+                                onClick={() => handleViewLog(log)}
+                              >
+                                <span>{truncate(log.prompt || '(empty prompt)', 28)}</span>
+                                <time>{threadRunning ? '运行中' : formatAge(log.created_at)}</time>
+                                {!threadRunning && <span className="delete-thread" onClick={(e) => handleDeleteThread(log, e)} title="删除线程">×</span>}
+                              </button>
+                            );
+                          })
+                        )}
+                        {projectLogs.length > 5 && (
+                          <button
+                            className="expand-toggle"
+                            onClick={() => setShowAllThreadsByProject((current) => ({ ...current, [key]: !showAllThreads }))}
+                          >
+                            {showAllThreads ? '收起' : `展开更多 (${projectLogs.length - 5})`}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 );
               })
             )}
-            {visibleLogs.length > 5 && (
-              <button className="expand-toggle" onClick={() => setShowAllThreads(!showAllThreads)}>
-                {showAllThreads ? '收起' : `展开更多 (${visibleLogs.length - 5})`}
-              </button>
-            )}
           </div>
-        </section>}
+        </section>
 
         <button className="settings-entry" onClick={() => setShowSettings(true)}>
           <span>⚙</span>设置

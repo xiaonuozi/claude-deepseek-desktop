@@ -55,6 +55,71 @@ func TestStreamParserDescribesToolTarget(t *testing.T) {
 	}
 }
 
+func TestStreamParserHidesToolResultPayload(t *testing.T) {
+	parser := newStreamParser()
+	secret := strings.Repeat("secret-content", 2000)
+	line, err := json.Marshal(map[string]interface{}{
+		"type":       "user",
+		"session_id": "session-tool",
+		"message": map[string]interface{}{
+			"role": "user",
+			"content": []interface{}{
+				map[string]interface{}{
+					"type":        "tool_result",
+					"tool_use_id": "toolu_1",
+					"content":     secret,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	eventType, display := parser.extract(string(line))
+	if eventType != "tool-result" {
+		t.Fatalf("expected tool-result, got %q", eventType)
+	}
+	if strings.Contains(display, "secret-content") {
+		t.Fatalf("tool result payload leaked to frontend display")
+	}
+	if !strings.Contains(display, "工具结果已隐藏") {
+		t.Fatalf("expected hidden payload summary, got %q", display)
+	}
+	if parser.sessionID != "session-tool" {
+		t.Fatalf("expected session id to be recovered, got %q", parser.sessionID)
+	}
+	meta := parser.meta()
+	if meta["content_hidden"] != true {
+		t.Fatalf("expected content_hidden meta, got %#v", meta)
+	}
+}
+
+func TestLimitFrontendDisplayChunkCapsTotal(t *testing.T) {
+	counters := &runCounters{}
+	first := strings.Repeat("a", maxFrontendDisplayChars-5)
+	text, emit, capped := limitFrontendDisplayChunk(first, counters)
+	if !emit || capped || text != first {
+		t.Fatalf("expected first chunk to pass through, emit=%t capped=%t len=%d", emit, capped, len(text))
+	}
+
+	text, emit, capped = limitFrontendDisplayChunk(strings.Repeat("b", 100), counters)
+	if !emit || !capped {
+		t.Fatalf("expected cap note to be emitted once, emit=%t capped=%t", emit, capped)
+	}
+	if strings.Contains(text, strings.Repeat("b", 20)) {
+		t.Fatalf("expected oversized display chunk to be hidden, got %q", text)
+	}
+	if !strings.Contains(text, "前端展示已达上限") {
+		t.Fatalf("expected frontend cap note, got %q", text)
+	}
+
+	text, emit, capped = limitFrontendDisplayChunk("later output", counters)
+	if emit || capped || text != "" {
+		t.Fatalf("expected later chunks to be suppressed, emit=%t capped=%t text=%q", emit, capped, text)
+	}
+}
+
 func TestStreamParserSuppressesLargeDuplicateFinalResult(t *testing.T) {
 	parser := newStreamParser()
 	parser.extract(`{"type":"message_start"}`)

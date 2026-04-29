@@ -1,4 +1,4 @@
-﻿package runner
+package runner
 
 import (
 	"bufio"
@@ -28,9 +28,11 @@ const (
 	maxParserJSONLineChars    = 1_000_000
 	maxParserStateChars       = 500_000
 	maxParserMetaChars        = 20_000
+	maxFrontendDisplayChars   = 500_000
 	diagnosticByteInterval    = 1_000_000
 	truncatedLogNote          = "\n\n[内容过长，内存预览已截断；如需完整 raw 流，可设置 CLAUDE_TOOLS_RAW_LOG=1 后重试]\n"
 	parserTruncatedNote       = "\n[内容过长，parser 状态已截断]\n"
+	frontendDisplayLimitNote  = "\n[前端展示已达上限，后续输出已隐藏；完整内容保存在本地日志/Claude 会话中]\n"
 )
 
 // Runner manages concurrent claude CLI processes.
@@ -94,20 +96,25 @@ func (b *cappedTextBuffer) Truncated() bool {
 }
 
 type runCounters struct {
-	stdoutLines            int
-	stderrLines            int
-	stdoutBytes            int
-	stderrBytes            int
-	maxStdoutLineBytes     int
-	maxStderrLineBytes     int
-	displayBytes           int
-	frontendTextTruncated  int
-	frontendRawTruncated   int
-	suppressedStdoutEvents int
-	suppressedStdoutBytes  int
-	eventsEmitted          int
-	parserWarnings         int
-	nextDiagnosticByteMark int
+	stdoutLines             int
+	stderrLines             int
+	stdoutBytes             int
+	stderrBytes             int
+	maxStdoutLineBytes      int
+	maxStderrLineBytes      int
+	displayBytes            int
+	frontendDisplayBytes    int
+	frontendDisplayHidden   int
+	frontendDisplayCapped   bool
+	frontendToolResults     int
+	frontendToolResultBytes int
+	frontendTextTruncated   int
+	frontendRawTruncated    int
+	suppressedStdoutEvents  int
+	suppressedStdoutBytes   int
+	eventsEmitted           int
+	parserWarnings          int
+	nextDiagnosticByteMark  int
 }
 
 // NewRunner creates a new Runner.
@@ -503,21 +510,41 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 					}
 				}
 				frontendDisplay := truncateFrontendPayload(display, maxFrontendEventTextChars)
+				emitToFrontend := true
+				displayLimitHit := false
 				outputMu.Lock()
 				if len(frontendDisplay) < len(display) {
 					counters.frontendTextTruncated++
 				}
-				counters.eventsEmitted++
+				if eventType == "display" {
+					frontendDisplay, emitToFrontend, displayLimitHit = limitFrontendDisplayChunk(frontendDisplay, &counters)
+					if !emitToFrontend {
+						counters.suppressedStdoutEvents++
+						counters.suppressedStdoutBytes += len(line) + 1
+					}
+				}
+				if eventType == "tool-result" {
+					counters.frontendToolResults++
+					counters.frontendToolResultBytes += len(line) + 1
+				}
+				if emitToFrontend {
+					counters.eventsEmitted++
+				}
 				outputMu.Unlock()
-				runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
-					Type:            eventType,
-					Text:            frontendDisplay,
-					RunID:           runID,
-					ThreadID:        req.ThreadID,
-					ClaudeSessionID: parser.sessionID,
-					Timestamp:       now,
-					Meta:            meta,
-				})
+				if displayLimitHit {
+					appendRunDiagnostic(req.ProjectPath, runID, fmt.Sprintf("phase=frontend_display_suppressed limit=%s", formatBytes(uint64(maxFrontendDisplayChars))))
+				}
+				if emitToFrontend {
+					runtime.EventsEmit(wailsCtx, "run-event", RunEvent{
+						Type:            eventType,
+						Text:            frontendDisplay,
+						RunID:           runID,
+						ThreadID:        req.ThreadID,
+						ClaudeSessionID: parser.sessionID,
+						Timestamp:       now,
+						Meta:            meta,
+					})
+				}
 			} else {
 				outputMu.Lock()
 				counters.suppressedStdoutEvents++
@@ -647,7 +674,7 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 	// Collect token usage from parser.
 	inputTokens, outputTokens := parser.usage()
 	appendRunDiagnostic(req.ProjectPath, runID, fmt.Sprintf(
-		"phase=before_persist exit_code=%d duration_ms=%d stdout_lines=%d stderr_lines=%d stdout_bytes=%s stderr_bytes=%s raw_preview=%s/%s raw_truncated=%t display_preview=%s/%s display_truncated=%t frontend_text_truncated=%d frontend_raw_truncated=%d parser_warnings=%d stream_events=%d suppressed_stdout_events=%d suppressed_stdout_bytes=%s stream_log=%q",
+		"phase=before_persist exit_code=%d duration_ms=%d stdout_lines=%d stderr_lines=%d stdout_bytes=%s stderr_bytes=%s raw_preview=%s/%s raw_truncated=%t display_preview=%s/%s display_truncated=%t frontend_display=%s hidden=%s capped=%t hidden_tool_results=%d hidden_tool_result_bytes=%s frontend_text_truncated=%d frontend_raw_truncated=%d parser_warnings=%d stream_events=%d suppressed_stdout_events=%d suppressed_stdout_bytes=%s stream_log=%q",
 		exitCode,
 		durationMS,
 		finalCounters.stdoutLines,
@@ -660,6 +687,11 @@ func (r *Runner) run(wailsCtx context.Context, req RunRequest, runID string) {
 		formatBytes(uint64(displayKeptBytes)),
 		formatBytes(uint64(displaySeenBytes)),
 		displayTruncated,
+		formatBytes(uint64(finalCounters.frontendDisplayBytes)),
+		formatBytes(uint64(finalCounters.frontendDisplayHidden)),
+		finalCounters.frontendDisplayCapped,
+		finalCounters.frontendToolResults,
+		formatBytes(uint64(finalCounters.frontendToolResultBytes)),
 		finalCounters.frontendTextTruncated,
 		finalCounters.frontendRawTruncated,
 		finalCounters.parserWarnings,
@@ -888,6 +920,51 @@ func truncateFrontendPayload(value string, limit int) string {
 	return value[:keep] + note
 }
 
+func hideToolResultForFrontend(line string) (map[string]interface{}, string) {
+	bytes := len(line)
+	meta := map[string]interface{}{
+		"isToolResult":   true,
+		"content_hidden": true,
+		"bytes":          bytes,
+	}
+	return meta, fmt.Sprintf("[工具结果已隐藏，未发送完整内容到前端；原始事件约 %s]\n", formatBytes(uint64(bytes)))
+}
+
+func isToolResultJSONLine(line string) bool {
+	return strings.Contains(line, `"type":"tool_result"`) || strings.Contains(line, `"type": "tool_result"`)
+}
+
+func limitFrontendDisplayChunk(display string, counters *runCounters) (string, bool, bool) {
+	if display == "" {
+		return "", false, false
+	}
+	if counters.frontendDisplayBytes >= maxFrontendDisplayChars {
+		counters.frontendDisplayHidden += len(display)
+		if counters.frontendDisplayCapped {
+			return "", false, false
+		}
+		counters.frontendDisplayCapped = true
+		counters.frontendDisplayBytes += len(frontendDisplayLimitNote)
+		return frontendDisplayLimitNote, true, true
+	}
+
+	remaining := maxFrontendDisplayChars - counters.frontendDisplayBytes
+	if len(display) <= remaining {
+		counters.frontendDisplayBytes += len(display)
+		return display, true, false
+	}
+
+	keep := remaining - len(frontendDisplayLimitNote)
+	if keep < 0 {
+		keep = 0
+	}
+	counters.frontendDisplayHidden += len(display) - keep
+	counters.frontendDisplayCapped = true
+	text := display[:keep] + frontendDisplayLimitNote
+	counters.frontendDisplayBytes += len(text)
+	return text, true, true
+}
+
 // meta returns the structured metadata for the most recent extract call.
 func (p *streamParser) meta() map[string]interface{} {
 	m := p.lastMeta
@@ -905,18 +982,19 @@ func (p *streamParser) extract(line string) (string, string) {
 		return "display", line + "\n"
 	}
 
-	if len(line) > maxParserJSONLineChars {
+	if isToolResultJSONLine(line) {
 		if sessionID := extractSimpleJSONStringField(line, "session_id"); sessionID != "" {
 			p.sessionID = sessionID
 		}
-		if strings.Contains(line, `"tool_result"`) {
-			p.warn("skipped oversized tool_result JSON line bytes=%s", formatBytes(uint64(len(line))))
-			p.lastMeta = map[string]interface{}{
-				"isToolResult": true,
-				"truncated":    true,
-				"bytes":        len(line),
-			}
-			return "tool-result", "[工具结果过长，已跳过解析；如需完整 raw 流，可设置 CLAUDE_TOOLS_RAW_LOG=1 后重试]\n"
+		meta, summary := hideToolResultForFrontend(line)
+		p.lastMeta = meta
+		p.warn("hid tool_result from frontend bytes=%s", formatBytes(uint64(len(line))))
+		return "tool-result", summary
+	}
+
+	if len(line) > maxParserJSONLineChars {
+		if sessionID := extractSimpleJSONStringField(line, "session_id"); sessionID != "" {
+			p.sessionID = sessionID
 		}
 		p.warn("skipped oversized JSON line bytes=%s", formatBytes(uint64(len(line))))
 		return "", ""
